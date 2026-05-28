@@ -1,0 +1,55 @@
+# strict.yaml — Research-grade intake thresholds (default)
+# Matches intake scanner v4 hardcoded values.
+# Use this profile for production research audio.
+
+profile_name: "Strict"
+
+# SNR thresholds (dB) — A-weighted (IEC 61672) as of v6.0
+# Calibrated against known-quality test corpus (April 2026)
+# SNR = A-weighted signal RMS - A-weighted noise floor RMS
+snr:
+  reject_below: 45.0     # below 45 → reject
+  warn_below: 53.0        # 45–53 → warn (manual denoising may help)
+  caution_below: 60.0     # 53–60 → caution (auto denoising candidate)
+  pass_above: 60.0        # above 60 → pass
+
+# Crest factor thresholds (dB) — unweighted (unchanged from v5)
+# CF = peak dB - RMS dB
+crest_factor:
+  warn_low: 10.0          # ≤ this → warn (severely over-compressed)
+  caution_low: 13.0       # ≤ this → caution (over-compressed)
+  caution_high: 999.0     # disabled — high dynamics not flagged
+  warn_high: 999.0        # disabled — high dynamics not flagged
+
+# True peak clip threshold is NOT configurable per profile.
+# It is hardcoded in the core script (0.0 dBTP with optional bias).
+
+# Noise floor estimation parameters
+noise_floor:
+  silence_threshold_mode: "relative"
+  silence_threshold_db: -40.0   # used when mode is "absolute"
+  silence_threshold_offset: -20.0  # used when mode is "relative"
+  min_segment_ms: 50            # minimum contiguous silence duration
+
+# Integrated LUFS (BS.1770-4) — speech level assessment
+# Calibrated against known-quality test corpus (April 2026)
+loudness:
+  reject_below: -42.0      # below -42 LUFS → reject (too quiet to salvage)
+  caution_below: -36.0     # below -36 LUFS → caution (may need gain adjustment)
+
+# Three-way sort rules
+# Disposition is determined by the worst flag across all metrics.
+# reject: any metric hits reject condition
+# salvageable: any metric hits warn (but none reject)
+# pass: all metrics are caution or better
+sort_rules:
+  reject_on:
+    - "snr_reject"              # SNR below reject floor
+    - "tp_clip"                 # any true-peak clip detected
+    - "format_fail"             # non-conforming format (not mono/48k/24-bit/WAV)
+    - "lufs_reject"             # integrated LUFS below reject floor
+  salvageable_on:
+    - "snr_warn"                # SNR in warn range
+    - "snr_caution"             # SNR in caution range
+    - "cf_warn"                 # CF in warn range (either direction)
+    - "lufs_caution"             # integrated LUFS in caution range

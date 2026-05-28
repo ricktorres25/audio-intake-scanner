@@ -1,0 +1,48 @@
+# default.yaml — Relaxed intake thresholds
+# Thresholds can be tightened toward strict as collection improves.
+
+profile_name: "Default"
+
+# SNR thresholds (dB) — A-weighted (IEC 61672) as of v6.0
+# Calibrated against known-quality test corpus (April 2026)
+snr:
+  reject_below: 38.0     # below 38 → reject (excessive noise)
+  warn_below: 48.0        # 38–48 → warn (manual denoising may help)
+  caution_below: 55.0     # 48–55 → caution (candidate for automated denoising)
+  pass_above: 55.0        # above 55 → pass (no denoising needed)
+
+# Crest factor thresholds (dB) — unweighted (unchanged from v5)
+# Only flag over-compressed (low CF). High dynamics are not a concern.
+crest_factor:
+  warn_low: 10.0
+  caution_low: 13.0
+  caution_high: 999.0
+  warn_high: 999.0
+
+# Noise floor estimation parameters
+noise_floor:
+  silence_threshold_mode: "relative"
+  silence_threshold_db: -40.0
+  silence_threshold_offset: -20.0
+  min_segment_ms: 50
+
+# Integrated LUFS (BS.1770-4) — speech level assessment
+# Calibrated against known-quality test corpus (April 2026)
+loudness:
+  reject_below: -42.0      # below -42 LUFS → reject (too quiet to salvage)
+  caution_below: -36.0     # below -36 LUFS → caution (may need gain adjustment)
+
+# Three-way sort rules (same logic, different thresholds apply)
+# snr_warn (20-23) and snr_caution (23-35) both route to salvageable;
+# the flag distinction tells the operator how much effort to expect.
+sort_rules:
+  reject_on:
+    - "snr_reject"
+    - "tp_clip"
+    - "format_fail"
+    - "lufs_reject"
+  salvageable_on:
+    - "snr_warn"
+    - "snr_caution"
+    - "cf_warn"
+    - "lufs_caution"
