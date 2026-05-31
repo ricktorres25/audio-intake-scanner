@@ -348,6 +348,11 @@ def measure_reference_noise_floor(file_path: Path) -> float:
 # Helpers
 # ------------------------------------------------------------
 def sec_to_timecode(seconds: float) -> str:
+    """Convert an input of seconds (float) and return a timecode string 
+    with zero padding that follows timecode convention (MM:SS.sss).
+
+    Examples: 10.7 s renders 00:10.700, and 8.95 s renders 00:08.950
+    """
     mins = int(seconds // 60)
     secs = seconds % 60
     return f"{mins:02d}:{secs:06.3f}"
