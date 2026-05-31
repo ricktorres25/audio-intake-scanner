@@ -920,6 +920,12 @@ def scan_file(file_path: Path, root_dir: Path = None,
 # Formatting helpers
 # ------------------------------------------------------------
 def _fmt_db(value: float, suffix: str = "dB") -> str:
+    """Format a value (float), return string with sign, value 
+    at one decimal precision and suffix ("dB" as default). 
+    Returns "N/A" when value is NaN.
+
+    Examples: -3.456 → "-3.5 dB", 0.0 → "+0.0 dB", NaN → "N/A"
+    """
     if np.isnan(value):
         return "N/A"
     return f"{value:+.1f} {suffix}"
