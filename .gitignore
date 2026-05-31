@@ -74,3 +74,6 @@ dmypy.json
 *.env
 *.env.local
 secrets.json
+
+# Local working notes for Claude Code (references local paths, program internals)
+CLAUDE.md
