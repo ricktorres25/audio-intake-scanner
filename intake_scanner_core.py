@@ -348,7 +348,7 @@ def measure_reference_noise_floor(file_path: Path) -> float:
 # Helpers
 # ------------------------------------------------------------
 def sec_to_timecode(seconds: float) -> str:
-    """Convert an input of seconds (float) and return a timecode string 
+    """Convert an input of seconds (float) and return a timecode string
     with zero padding that follows timecode convention (MM:SS.sss).
 
     Examples: 10.7 s renders 00:10.700, and 8.95 s renders 00:08.950
@@ -920,8 +920,8 @@ def scan_file(file_path: Path, root_dir: Path = None,
 # Formatting helpers
 # ------------------------------------------------------------
 def _fmt_db(value: float, suffix: str = "dB") -> str:
-    """Format a value (float), return string with sign, value 
-    at one decimal precision and suffix ("dB" as default). 
+    """Format a value (float), return string with sign, value
+    at one decimal precision and suffix ("dB" as default).
     Returns "N/A" when value is NaN.
 
     Examples: -3.456 → "-3.5 dB", 0.0 → "+0.0 dB", NaN → "N/A"
