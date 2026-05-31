@@ -420,6 +420,24 @@ def load_audio(file_path: Path) -> tuple[np.ndarray, int]:
 # ------------------------------------------------------------
 def find_peaks_with_timecodes(data: np.ndarray, sr: int,
                               bias_db: float = TP_CLIP_BIAS_DB) -> list[str]:
+    """Identify true peak clips and near clips in a mono signal, return timecodes with labels.
+
+    Args:
+        data: mono audio signal as a 1D numpy array of floats in the range [-1.0, +1.0].
+        sr: The sample rate of the audio signal, used to convert sample positions to timecodes.
+        bias_db: The bias in decibels to adjust the threshold for true peak clip detection.
+            Operator toggled, off by default.
+
+    Returns:
+        A list of strings representing the timecodes "MM:SS.mmm" and labels of identified
+            peaks, their shape "TP CLIP (±0.60 dBTP)", as well as a "CLEAN" label if no peaks are found.
+
+    Notes:
+        True peak detection selected because it oversamples, so it'll catch overs even if sample
+            doesn't hit full scale.
+        Output is display-format only, not intended for programmatic parsing.
+            Designed for human-readable reports, machine parsing would require a structured output format change.
+    """
     sample_threshold = 10 ** (SAMPLE_THRESHOLD_DB / 20)
     debounce_samples = int(DEBOUNCE_MS / 1000 * sr)
     context_samples  = max(int(CONTEXT_MS / 1000 * sr), 32)
