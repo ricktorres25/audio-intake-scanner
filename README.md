@@ -35,8 +35,6 @@ This auto-runs the scan and writes the report, but still requires a display beca
 
 The `--headless` flag is misnamed. It auto-runs the scan without manual interaction, but it still spins up a Tkinter window and requires a display server. A true headless mode is planned.
 
-Finder color labels are macOS only. The scan and report writing should work on Linux and Windows, but this has not been tested.
-
 The threshold profiles ship calibrated against a single known-quality test corpus from April 2026. SNR, LUFS, and the content-based noise profile crest-factor ceiling all reflect that corpus. Different domains will likely need different thresholds.
 
 No automated tests yet. Behavior has been validated by running against the test corpus and checking output against the spec, but there is no `tests/` folder in the repo.
