@@ -89,7 +89,11 @@ CONTEXT_MS          = 5
 MAX_BURST_MS        = 500
 SAFE_SAMPLE_THRESHOLD = 0.89125
 
-# Measurement bias compensation — see v4 comments for rationale.
+# TODO(deprecate): remove the operator bias toggle in a future rev — the bias_db
+# param (threaded through find_peaks_with_timecodes, scan_file, and the report
+# builders) and the GUI "Bias compensation" checkbox / --bias flag are unused in
+# practice with no edge-case benefit. TP_CLIP_BIAS_DB stays as the fixed
+# compensation; only the operator-facing override goes.
 TP_CLIP_BIAS_DB = -0.10
 
 _TRUE_NEAR_LINEAR = 10 ** (TRUE_NEAR_DBTP / 20)
