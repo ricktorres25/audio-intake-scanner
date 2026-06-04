@@ -505,9 +505,6 @@ def find_peaks_with_timecodes(data: np.ndarray, sr: int,
 
 # ------------------------------------------------------------
 # Noise floor estimation
-# v6: accepts optional data_weighted for A-weighted RMS measurement
-# Gating (silence detection) always uses unweighted data.
-# RMS measurement uses data_weighted when provided.
 # ------------------------------------------------------------
 def estimate_noise_floor(data: np.ndarray, sr: int, config: dict = None,
                          data_weighted: np.ndarray = None) -> float:
@@ -532,13 +529,13 @@ def estimate_noise_floor(data: np.ndarray, sr: int, config: dict = None,
 
     Notes:
 
-        Gating takes place on the unweighted data, if data_weighted is provided, RMS measurement will be computed fom that
+        Gating takes place on the unweighted data, if data_weighted is provided, RMS measurement will be computed from that
             instead. Unweighted gate determines silence by true amplitude; weighted data is used to correlate measurement with
-                perception.
+            perception.
         Two modes: relative uses file's own RMS so content dependent, while absolute uses a fixed dB threshold.
-        “Best effort” fallback that overstates noise floor.  Intra speech silence measurement is imperfect because of the residual
+        "Best effort" fallback that overstates noise floor.  Intra speech silence measurement is imperfect because of the residual
             speech/room artifacts in such a short window, so generally skews higher than when using noise profile, with a per
-                recording variance that can't be normalized for.
+            recording variance that can't be normalized for.
         Caution to not compare dBFS results to dBA-calibrated thresholds.
     """
     if config is None:
