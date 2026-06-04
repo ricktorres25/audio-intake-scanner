@@ -511,7 +511,36 @@ def find_peaks_with_timecodes(data: np.ndarray, sr: int,
 # ------------------------------------------------------------
 def estimate_noise_floor(data: np.ndarray, sr: int, config: dict = None,
                          data_weighted: np.ndarray = None) -> float:
-    """Returns noise floor in dBA (when A-weighted data provided) or dBFS, or NaN if no silent segments found."""
+    """Detect silent stretches in the signal, measure RMS across just those stretches to estimate the
+        noise floor. Fallback, best effort mechanism for noise floor estimation, not reliable enough to consider
+        in disposition.
+
+    Args:
+
+        data: 1D float mono signal, used for silence gating. Also used for RMS measurement only when data_weighted is absent.
+        sr: sample rate.  Convert min_segment_ms to samples.
+        config: threshold dict, defaults to DEFAULT_CONFIG.  Only uses noise_floor section of config.
+        data_weighted: Optional copy of data, A-weighted.  If present, switch return unit to dBA (only unit, not scope, gating
+            still happens).
+
+    Returns:
+
+        dBFS float, unless data_weighted, in which case dBA float.
+        NaN when there's no qualifying silent segment, or signal is silent when in relative mode.
+        -120.0 when silent segments are detected but their RMS is extremely low (below 1e-10 linear).
+            This is a floor value to avoid returning -inf dB.
+
+    Notes:
+
+        Gating takes place on the unweighted data, if data_weighted is provided, RMS measurement will be computed fom that
+            instead. Unweighted gate determines silence by true amplitude; weighted data is used to correlate measurement with
+                perception.
+        Two modes: relative uses file's own RMS so content dependent, while absolute uses a fixed dB threshold.
+        “Best effort” fallback that overstates noise floor.  Intra speech silence measurement is imperfect because of the residual
+            speech/room artifacts in such a short window, so generally skews higher than when using noise profile, with a per
+                recording variance that can't be normalized for.
+        Caution to not compare dBFS results to dBA-calibrated thresholds.
+    """
     if config is None:
         config = DEFAULT_CONFIG
 
