@@ -22,6 +22,10 @@ The library choices are deliberate, not defaults.
 
 `scipy.signal.resample_poly` does the 4x upsampling for true-peak detection, so inter-sample peaks that sit between two samples are caught instead of missed. The A-weighting filter is built with `bilinear_zpk` and `zpk2sos` and applied with `sosfilt`, which is the numerically stable way to run an IIR filter. `pyloudnorm` provides the BS.1770-4 loudness measurement. `soundfile` handles WAV I/O, with `pydub` (and `ffmpeg`) as the fallback for non-WAV inputs. `numpy` underlies all of the signal math, and `pyyaml` loads the threshold profiles.
 
+## How it's built
+
+Through AI pair programming: I authored the requirements and audio specs, sketched the design, directed the build, and reviewed the results against the test corpus.
+
 ## Requirements
 
 Python 3.10 or newer, plus the packages in `requirements.txt` (`numpy`, `scipy`, `soundfile`, `pydub`, `pyloudnorm`, `tkinterdnd2`). `pydub` requires `ffmpeg` available on `PATH` for non-WAV inputs.
