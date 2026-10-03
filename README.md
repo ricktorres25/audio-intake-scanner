@@ -3,7 +3,7 @@
 Audio batch QC for production pipeline intake. Give it a folder and it measures every audio file inside, writes two reports into that folder, and sets a Finder label on each file.
 
 Version 8 has three profiles:
-- **Platform Band**, the default, reads each file the way a voice-data collection platform's Rec QC stages 1 and 2 would, using copies of that platform's own two cores.
+- **Platform Band**, the default, reads each file the way my voice-data collection platform's Rec QC stages 1 and 2 would, using copies of that platform's own two cores.
 - **v7** and **Strict** answer the editing question, how much work a file needs, with version 7's numbers.
 
 ## Why use it
