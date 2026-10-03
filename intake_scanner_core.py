@@ -1,5 +1,45 @@
-# intake_scanner_core_v7.py
-# v7.0 changes:
+# intake_scanner_core.py
+# v8.0 changes:
+# - Uses vendored copies of the collection platform's two Rec QC cores, under
+#   cores/. Importing them runs a start check against cores/VENDORED.json.
+#   A-weighting and a reference's whole-file A-weighted RMS now come from the
+#   noise core (bit-identical to v7's own copy), and the whole-file true peak
+#   from the level core.
+# - Clip fix: the clip decision uses the whole-file 4x true peak against
+#   0.0 dBTP, or -0.10 with the bias toggle. The windowed finder still supplies
+#   the timecodes; a clip it has no event for is listed without a timecode.
+# - A noise take found by content scan is treated like a named one. v7 scanned
+#   it as content against its own floor and rejected it.
+# - The noise core's trimmed output name, _np, counts as a noise-take name.
+# - scan_folder(): the folder scan v7 ran inside the GUI's run_scan, moved here
+#   so the report rows and the tests run the same path. Display and Finder
+#   labels stay in the GUI.
+# - INTAKE_REPORT.jsonl beside INTAKE_REPORT.txt: a run record, then one row
+#   per file with relative paths, noise-floor method and confidence, policy
+#   hashes, and RT60 and drift as n/a with the reason.
+# - The text report's FILE: line is relative to the scanned folder, an error
+#   line no longer carries the folder's absolute path, and the header states
+#   RT60 and drift once as n/a. No other line changes.
+# - Platform Band, a third profile: configs/platform/platform_band.yaml points
+#   at the cores' own policies and holds no thresholds. scan_folder_platform()
+#   runs the platform's two calls per file (write_outputs off), rows carry the
+#   records' readout and hashes, and the text report uses platform blocks.
+# - FLAC is measured like WAV: 24-bit, mono, 48 kHz, .wav or .flac. FLAC is
+#   lossless, the platform stores its takes as FLAC, and the noise core accepts
+#   it. The content scan for a noise take considers FLAC too.
+# - With no noise take, the per-file floor is the quietest steady stretch of
+#   the file (estimate_quiet_floor), not v7's silence gate, whose error grew
+#   with how quiet the room was. The number still has low confidence, gives no
+#   band and never sorts. Rows name the method per_file_quiet_window
+#   (schema 1.1).
+# - A noise take of digital silence (whole-file floor at or below -110 dBA) is
+#   never a folder's reference, under any profile. It stays a noise take, its
+#   row reads confidence none with reason digital_silence, and the report says
+#   it is not used. Under Platform Band this differs from the platform's noise
+#   core on purpose: an intake folder has no live capture or clap test to catch
+#   such a take.
+#
+# v7.0 changes (preserved):
 # - Content-based noise profile fallback in find_noise_profiles():
 #   when no named -blank/-noise file exists in a folder, scan remaining
 #   WAVs by crest factor and pick the lowest-CF candidate at or below
@@ -38,11 +78,13 @@
 import os
 import sys
 import re
+import json
+import math
 import numpy as np
 import yaml
 from pathlib import Path
 from datetime import datetime
-from scipy.signal import resample_poly, sosfilt
+from scipy.signal import resample_poly
 
 # ------------------------------------------------------------
 # CRITICAL: Make ffmpeg/ffprobe work in frozen app (PyInstaller)
@@ -79,6 +121,15 @@ except ImportError:
     PYLN_AVAILABLE = False
 
 # ------------------------------------------------------------
+# Vendored Rec QC cores (v8). Importing the cores package runs the start
+# check first: a copy that differs from cores/VENDORED.json raises
+# VendoredCoreError here, naming the file, before any vendored code runs.
+# ------------------------------------------------------------
+from cores import level_check_phrase_core as level_core
+from cores import noise_profile_scanner_core as noise_core
+from cores import CORES_DIR, load_manifest
+
+# ------------------------------------------------------------
 # Config – true-peak detection (hardcoded, not profile-dependent)
 # ------------------------------------------------------------
 SAMPLE_THRESHOLD_DB = -0.2
@@ -101,6 +152,29 @@ _TRUE_HARD_LINEAR = 10 ** ((TRUE_HARD_DBTP + TP_CLIP_BIAS_DB) / 20)
 
 # Sentinel for unavailable noise floor
 NOISE_FLOOR_UNAVAILABLE = float('nan')
+
+# v8: the containers that are measured (with 24-bit, mono, 48 kHz). FLAC is
+# lossless, so it carries the same samples a 24-bit WAV would.
+MEASURED_EXTENSIONS = (".wav", ".flac")
+
+# ------------------------------------------------------------
+# v8: versions, report file names, and the fixed not-applicable fields
+#
+# ------------------------------------------------------------
+SCANNER_VERSION = "intake_scanner_core_v8"
+REPORT_VERSION = "8.0"
+ROWS_SCHEMA_VERSION = "1.1"   # 1.1: noise_floor_method per_file_quiet_window replaces per_file_silence
+REPORT_NAME = "INTAKE_REPORT.txt"
+ROWS_NAME = "INTAKE_REPORT.jsonl"
+
+RT60_REASON = ("RT60 needs a clap recording and runs as Rec QC stage 3. "
+               "The intake scanner does not measure it.")
+DRIFT_REASON = ("Drift compares a re-record against a kept baseline. "
+                "An intake batch has neither.")
+# The text report's one header line for both (worded so the sibling harnesses'
+# "baseline <number> dBA" pattern cannot match it).
+RT60_DRIFT_HEADER_LINE = ("RT60 and drift: n/a — not measured here (RT60 needs a clap "
+                          "recording; drift needs a re-record and a kept take)")
 
 # ------------------------------------------------------------
 # YAML config loading
@@ -158,9 +232,44 @@ def load_config(config_path: Path = None) -> dict:
     if not isinstance(user_config, dict):
         raise ValueError(f"Config file must contain a YAML mapping, got {type(user_config).__name__}")
 
+    # v8: a pointer profile carries no thresholds and is not merged over these.
+    if user_config.get("readout") == "platform":
+        return load_platform_profile(config_path, user_config)
+
     # Merge top-level scalars and nested dicts
     _merge_config(config, user_config)
     return config
+
+
+def load_platform_profile(config_path: Path, pointer: dict) -> dict:
+    """Resolve a pointer profile. The noise core loads its own
+    policy file through its own load_config, the call the platform makes at
+    boot; the level core keeps its built-in policy, as the platform passes no
+    config. A missing policy file raises: the scan stops, never falls back.
+
+    Returns the profile the Platform Band path reads. It holds no scanner
+    thresholds, only the cores' resolved policies. (The per-file estimate takes
+    no settings from the profile; see estimate_quiet_floor.)"""
+    config_path = Path(config_path)
+    cores_section = pointer.get("cores") or {}
+    noise_rel = cores_section.get("noise_profile_config")
+    if not noise_rel:
+        raise ValueError(f"{config_path.name}: cores.noise_profile_config is missing")
+    if cores_section.get("level_check_config") is not None:
+        raise ValueError(f"{config_path.name}: the level core takes no policy file yet, "
+                         "so level_check_config must be null")
+    noise_path = CORES_DIR.parent / noise_rel     # relative to the scanner folder
+    if not noise_path.is_file():
+        raise FileNotFoundError(
+            f"Platform policy file not found: {noise_rel} (named by {config_path.name}). "
+            "The scan stops here; it does not fall back to another policy.")
+    return {
+        "profile_name": pointer.get("profile_name", "Platform Band"),
+        "readout": "platform",
+        "noise_profile_config": noise_rel,
+        "noise_policy": noise_core.load_config(noise_path),
+        "level_policy": level_core.DEFAULT_CONFIG,
+    }
 
 
 def _deep_copy_dict(d: dict) -> dict:
@@ -194,68 +303,32 @@ def get_builtin_config_dir() -> Path:
 
 
 def list_builtin_profiles() -> list[Path]:
-    """Return paths to all .yaml files in the builtin configs directory."""
+    """Return paths to all .yaml files in the builtin configs directory.
+    v8: also configs/platform/, where pointer profiles sit out of v7's sight."""
     config_dir = get_builtin_config_dir()
     if not config_dir.exists():
         return []
-    return sorted(config_dir.glob("*.yaml"))
+    return sorted(config_dir.glob("*.yaml")) + sorted((config_dir / "platform").glob("*.yaml"))
 
 
 # ------------------------------------------------------------
-# A-weighting (IEC 61672)
+# A-weighting (IEC 61672) — v8 uses the vendored noise core's filter.
+# The scanner's own copy was bit-identical to it and is
+# removed, so the scanner and Rec QC share one A-weighting.
 # ------------------------------------------------------------
-def a_weight(data: np.ndarray, sr: int) -> np.ndarray:
-    """Apply IEC 61672 A-weighting filter to audio data.
-    Uses a pre-computed analog prototype converted to digital SOS form
-    via bilinear transform at the given sample rate."""
-    from scipy.signal import zpk2sos, bilinear_zpk
-
-    # IEC 61672 A-weighting analog prototype poles and zeros
-    # Zeros: 4 at s=0 (two double zeros)
-    # Poles from the standard filter frequencies
-    f1 = 20.598997
-    f2 = 107.65265
-    f3 = 737.86223
-    f4 = 12194.217
-
-    # Analog zeros and poles (rad/s)
-    z_analog = np.array([0, 0, 0, 0])
-    p_analog = np.array([
-        -2 * np.pi * f1,
-        -2 * np.pi * f1,
-        -2 * np.pi * f2,
-        -2 * np.pi * f3,
-        -2 * np.pi * f4,
-        -2 * np.pi * f4,
-    ])
-
-    # Gain: normalize so that 1 kHz = 0 dB
-    # The A-weighting transfer function magnitude at 1 kHz
-    # |H(j*2*pi*1000)| should equal 1 (0 dB)
-    # Compute the analog gain constant
-    num_1k = (2 * np.pi * 1000) ** 4  # from 4 zeros at origin
-    denom_1k = 1.0
-    for p in p_analog:
-        denom_1k *= abs(1j * 2 * np.pi * 1000 - p)
-    k_analog = denom_1k / num_1k
-
-    # Convert to digital via bilinear transform
-    z_dig, p_dig, k_dig = bilinear_zpk(z_analog, p_analog, k_analog, fs=sr)
-
-    # Convert to second-order sections for numerical stability
-    sos = zpk2sos(z_dig, p_dig, k_dig)
-
-    return sosfilt(sos, data).astype(np.float32)
+a_weight = noise_core.a_weight
 
 
 # ------------------------------------------------------------
 # Noise profile detection and reference measurement
 # ------------------------------------------------------------
-_NOISE_PROFILE_SUFFIXES = ("-blank", "_blank", "-noise", "_noise")
+# v8: "_np" is the noise core's name for a noise take trimmed to its clean run,
+# which the platform stores.
+_NOISE_PROFILE_SUFFIXES = ("-blank", "_blank", "-noise", "_noise", "_np")
 
 def is_noise_profile(file_path: Path) -> bool:
     """Check if a file is a noise profile based on naming convention.
-    Matches filenames ending in -blank, _blank, -noise, or _noise (before extension)."""
+    Matches filenames ending in -blank, _blank, -noise, _noise or _np (before extension)."""
     stem = file_path.stem.lower()
     return any(stem.endswith(s) for s in _NOISE_PROFILE_SUFFIXES)
 
@@ -269,13 +342,30 @@ _NOISE_CONTENT_CF_MAX_DB = 14.65
 # Files at or below this RMS are silent/empty and skipped during content detection.
 _NOISE_CONTENT_RMS_MIN_DBFS = -90.0
 
+# v8: a noise take this quiet (whole-file A-weighted floor, dBA) is digital silence,
+# not a room, and is never a folder's reference, under any profile. The same
+# line estimate_quiet_floor draws for frames. Real rooms measured so far sit
+# between -80 and -95 dBA.
+SILENT_TAKE_DBA = -110.0
+
+
+def is_digital_silence_take(file_path: Path) -> bool:
+    """True when a noise take is digital silence: its whole-file A-weighted floor
+    is at or below SILENT_TAKE_DBA. An unreadable file is not called silent here;
+    the scan reports it as it always has."""
+    try:
+        floor = measure_reference_noise_floor(Path(file_path))
+    except Exception:
+        return False
+    return not np.isnan(floor) and floor <= SILENT_TAKE_DBA
+
 
 def find_noise_profiles(folder: Path, extensions: set = None) -> dict[Path, tuple[Path, str]]:
     """Find noise profile files grouped by parent folder, with content fallback.
 
     Pass 1 (name): any file whose stem ends with -blank/_blank/-noise/_noise.
-    Pass 2 (content): if Pass 1 finds nothing in a folder, scan remaining WAVs
-        by crest factor and pick the lowest-CF candidate at or below
+    Pass 2 (content): if Pass 1 finds nothing in a folder, scan remaining WAV
+        and FLAC files (v8) by crest factor and pick the lowest-CF candidate at or below
         _NOISE_CONTENT_CF_MAX_DB (14.65 dB). Files at or below
         _NOISE_CONTENT_RMS_MIN_DBFS (-90 dBFS) are skipped as silent/empty.
 
@@ -295,9 +385,10 @@ def find_noise_profiles(folder: Path, extensions: set = None) -> dict[Path, tupl
     profiles: dict[Path, tuple[Path, str]] = {}
 
     for parent, candidates in by_folder.items():
-        # Pass 1: naming convention
+        # Pass 1: naming convention. v8: a take of digital silence is passed over,
+        # so another noise-named file, or the content scan, can serve instead.
         for f in candidates:
-            if is_noise_profile(f):
+            if is_noise_profile(f) and not is_digital_silence_take(f):
                 profiles[parent] = (f, "name")
                 break
 
@@ -305,12 +396,12 @@ def find_noise_profiles(folder: Path, extensions: set = None) -> dict[Path, tupl
             continue
 
         # Pass 2: content scan — lowest CF at or below threshold
-        # Only WAV files are considered (non-WAV blanks are unusual and
-        # crest factor is less reliable across codecs at low levels).
+        # Only WAV and FLAC files are considered (other blanks are unusual and
+        # crest factor is less reliable across lossy codecs at low levels).
         best_path: Path | None = None
         best_cf = float("inf")
         for f in candidates:
-            if f.suffix.lower() != ".wav":
+            if f.suffix.lower() not in MEASURED_EXTENSIONS:
                 continue
             try:
                 data, _ = load_audio(f)
@@ -337,15 +428,14 @@ def find_noise_profile_path(folder: Path, extensions: set = None) -> dict[Path, 
 def measure_reference_noise_floor(file_path: Path) -> float:
     """Measure A-weighted RMS of an entire noise profile file.
     The whole file is treated as noise — no silence gating needed.
-    Returns noise floor in dBA."""
+    Returns noise floor in dBA.
+
+    v8: the measurement is the noise core's measure_aweighted_rms_dba, the same
+    formula v7 carried (-120.0 for digital silence). Its None for an empty
+    file maps to NaN, as before."""
     data, sr = load_audio(file_path)
-    if len(data) == 0:
-        return NOISE_FLOOR_UNAVAILABLE
-    data_weighted = a_weight(data, sr)
-    rms = np.sqrt(np.mean(data_weighted ** 2))
-    if rms < 1e-10:
-        return -120.0
-    return 20 * np.log10(rms)
+    floor = noise_core.measure_aweighted_rms_dba(data, sr)
+    return NOISE_FLOOR_UNAVAILABLE if floor is None else floor
 
 
 # ------------------------------------------------------------
@@ -512,6 +602,9 @@ def estimate_noise_floor(data: np.ndarray, sr: int, config: dict = None,
         noise floor. Fallback, best effort mechanism for noise floor estimation, not reliable enough to consider
         in disposition.
 
+    v8: scan_file no longer calls this; it uses estimate_quiet_floor below. Kept as v7 had it, for
+        comparison.
+
     Args:
 
         data: 1D float mono signal, used for silence gating. Also used for RMS measurement only when data_weighted is absent.
@@ -583,6 +676,69 @@ def estimate_noise_floor(data: np.ndarray, sr: int, config: dict = None,
         return -120.0
 
     return 20 * np.log10(rms)
+
+
+# ------------------------------------------------------------
+# v8: the per-file floor when a folder has no noise take. scan_file uses this
+# instead of estimate_noise_floor above, which stays for comparison. The number
+# is shown with low confidence, gives no band and never sorts.
+# ------------------------------------------------------------
+QUIET_FRAME_MS = 50          # A-weighted frame length
+QUIET_HOP_MS = 25            # frame hop
+QUIET_SILENT_DBA = -110.0    # a frame at or below this is digital silence, not the room
+QUIET_GUARD_MS = 50          # frames this close to digital silence are ignored too (gate edges)
+QUIET_WINDOW_S = 0.3         # the length of the quiet stretch measured
+QUIET_STEADY_DB = 2.0        # its frames may vary by this much and no more
+
+
+def estimate_quiet_floor(data_weighted: np.ndarray, sr: int,
+                         window_s: float = QUIET_WINDOW_S,
+                         steady_db: float = QUIET_STEADY_DB,
+                         guard_ms: float = QUIET_GUARD_MS,
+                         silent_dba: float = QUIET_SILENT_DBA) -> float:
+    """The floor of a file with no noise take: the quietest steady stretch.
+
+    The A-weighted signal is measured in 50 ms frames on a 25 ms hop. Frames of
+    digital silence, and the frames within guard_ms of them, are ignored. The
+    quietest run of frames spanning window_s is the floor (its mean power, in
+    dBA), but only if its frames vary by steady_db or less: room noise is
+    steady, a breath or a decay tail is not.
+
+    Returns NaN (no estimate) when no such run exists, or when the quietest one
+    is not steady. The keyword arguments exist for the tests' near misses; the
+    scanner always uses the defaults.
+    """
+    n = int(sr * QUIET_FRAME_MS / 1000)
+    hop = int(sr * QUIET_HOP_MS / 1000)
+    if len(data_weighted) < n:
+        return NOISE_FLOOR_UNAVAILABLE
+    c = np.concatenate(([0.0], np.cumsum(data_weighted.astype(np.float64) ** 2)))
+    starts = np.arange(0, len(data_weighted) - n + 1, hop)
+    power = (c[starts + n] - c[starts]) / n
+    frame_db = 10 * np.log10(np.maximum(power, 1e-20))
+
+    k = max(int(round(window_s * 1000 / QUIET_HOP_MS)) - 1, 1)   # k frames span window_s
+    if len(frame_db) < k:
+        return NOISE_FLOOR_UNAVAILABLE
+
+    silent = frame_db <= silent_dba
+    ignored = silent.copy()
+    for d in range(1, int(guard_ms / QUIET_HOP_MS) + 1):         # widen each silent frame both ways
+        ignored[d:] |= silent[:-d]
+        ignored[:-d] |= silent[d:]
+
+    # The mean power of every run of k frames with no ignored frame in it.
+    usable = np.concatenate(([0], np.cumsum(~ignored)))
+    cp = np.concatenate(([0.0], np.cumsum(power)))
+    s = np.arange(0, len(frame_db) - k + 1)
+    clean = (usable[s + k] - usable[s]) == k
+    if not clean.any():
+        return NOISE_FLOOR_UNAVAILABLE
+    means = np.where(clean, (cp[s + k] - cp[s]) / k, np.inf)
+    best = int(np.argmin(means))
+    if frame_db[best:best + k].std() > steady_db:
+        return NOISE_FLOOR_UNAVAILABLE
+    return float(10 * np.log10(means[best]))
 
 # ------------------------------------------------------------
 # Crest factor and signal RMS (unchanged — stays unweighted)
@@ -704,6 +860,23 @@ def classify_disposition(result: dict, config: dict) -> str:
         return "reference"
 
     sort_rules = config["sort_rules"]
+    flags_present = disposition_flags(result, config)
+
+    # Apply sort rules: reject takes priority, then salvageable
+    for trigger in sort_rules.get("reject_on", []):
+        if trigger in flags_present:
+            return "reject"
+
+    for trigger in sort_rules.get("salvageable_on", []):
+        if trigger in flags_present:
+            return "salvageable"
+
+    return "pass"
+
+
+def disposition_flags(result: dict, config: dict) -> set:
+    """The flags classify_disposition sorts on (v8: split out of it unchanged,
+    so each JSONL row can carry them)."""
     flags_present = set()
 
     # Check format issues
@@ -745,16 +918,7 @@ def classify_disposition(result: dict, config: dict) -> str:
         elif lufs < loud_cfg.get("caution_below", loud_cfg.get("warn_below", -36.0)):
             flags_present.add("lufs_caution")
 
-    # Apply sort rules: reject takes priority, then salvageable
-    for trigger in sort_rules.get("reject_on", []):
-        if trigger in flags_present:
-            return "reject"
-
-    for trigger in sort_rules.get("salvageable_on", []):
-        if trigger in flags_present:
-            return "salvageable"
-
-    return "pass"
+    return flags_present
 
 # ------------------------------------------------------------
 # Peak outlier detection
@@ -814,11 +978,15 @@ def _severity_tier(r: dict, config: dict) -> int:
 def scan_file(file_path: Path, root_dir: Path = None,
               bias_db: float = TP_CLIP_BIAS_DB,
               config: dict = None,
-              reference_noise_floor_db: float = None) -> dict:
+              reference_noise_floor_db: float = None,
+              noise_take: bool = None) -> dict:
     """Scan a single audio file.
     reference_noise_floor_db: when provided, used as the noise floor for SNR
         instead of per-file silence detection. Typically from a folder's
-        noise profile (-blank/-noise) file."""
+        noise profile (-blank/-noise) file.
+    noise_take: v8. True when the caller knows this file is the folder's noise
+        take, which is how scan_folder marks a take found by content scan.
+        None keeps v7's rule: the file name alone decides."""
     if config is None:
         config = DEFAULT_CONFIG
 
@@ -835,8 +1003,8 @@ def scan_file(file_path: Path, root_dir: Path = None,
         format_issues.append(f"{info['sample_rate']} Hz — expected 48000 Hz")
     if str(info["bit_depth"]) != "24":
         format_issues.append(f"{info['bit_depth']}-bit — expected 24-bit")
-    if file_path.suffix.lower() != ".wav":
-        format_issues.append(f"File is {file_path.suffix} — expected .wav")
+    if file_path.suffix.lower() not in MEASURED_EXTENSIONS:
+        format_issues.append(f"File is {file_path.suffix} — expected .wav or .flac")
 
     if format_issues:
         ch = info["channels"]
@@ -867,6 +1035,10 @@ def scan_file(file_path: Path, root_dir: Path = None,
             "format_issues": format_issues,
             "skipped": True,
             "disposition": "reject",
+            # v8 row fields (not measured on a skipped file)
+            "true_peak_dbtp": float('nan'),
+            "speech_level_dba": float('nan'),
+            "channel_count": ch if isinstance(ch, int) else None,
         }
 
     data, sr = load_audio(file_path)
@@ -874,13 +1046,23 @@ def scan_file(file_path: Path, root_dir: Path = None,
     if len(data) == 0:
         raise RuntimeError("Audio file is empty")
 
-    _is_noise_profile = is_noise_profile(file_path)
+    _is_noise_profile = is_noise_profile(file_path) if noise_take is None else noise_take
 
     duration = len(data) / sr
     global_peak = np.max(np.abs(data))
     global_dbtp = 20 * np.log10(global_peak + 1e-10) if global_peak > 0 else float('-inf')
     events = find_peaks_with_timecodes(data, sr, bias_db=bias_db)
-    has_clip = any("TP CLIP" in e for e in events)
+
+    # v8 clip fix. The clip decision is the level core's whole-file 4x true
+    # peak against the finder's own line (0.0 dBTP, or -0.10 with bias). The
+    # finder only oversamples around samples at or above -0.2 dBFS, so it misses
+    # an over whose samples all sit lower; it still supplies the timecodes.
+    true_peak_dbtp = level_core.measure_true_peak(data, sr)
+    has_clip = true_peak_dbtp is not None and true_peak_dbtp >= TRUE_HARD_DBTP + bias_db
+    if has_clip and not any("TP CLIP" in e for e in events):
+        missed = (f"--:--.--- → TP CLIP ({true_peak_dbtp:+.2f} dBTP) — "
+                  f"whole-file true peak, no timecode")
+        events = [missed] if events == ["CLEAN"] else events + [missed]
 
     worst_dbtp = -99.0
     for event in events:
@@ -902,14 +1084,15 @@ def scan_file(file_path: Path, root_dir: Path = None,
         noise_floor_db = reference_noise_floor_db
         noise_floor_source = "reference"
     else:
-        # Fallback: per-file silence detection
-        noise_floor_db = estimate_noise_floor(data, sr, config=config, data_weighted=data_weighted)
+        # Fallback, v8: the quietest steady stretch of the file. Informational only.
+        noise_floor_db = estimate_quiet_floor(data_weighted, sr)
         noise_floor_source = "per-file" if not np.isnan(noise_floor_db) else "unavailable"
 
     # Crest factor stays unweighted (standard practice)
     crest_factor_db, rms_db = compute_crest_factor(data)
 
     # SNR computation
+    speech_level_dba = float('nan')   # v8 row field: content files only
     if _is_noise_profile:
         # Noise profile: SNR is meaningless (all noise)
         snr_db = 0.0
@@ -920,6 +1103,7 @@ def scan_file(file_path: Path, root_dir: Path = None,
             rms_weighted_db = -120.0
         else:
             rms_weighted_db = 20 * np.log10(signal_rms_weighted)
+        speech_level_dba = rms_weighted_db
 
         if np.isnan(noise_floor_db):
             snr_db = NOISE_FLOOR_UNAVAILABLE
@@ -957,6 +1141,10 @@ def scan_file(file_path: Path, root_dir: Path = None,
         "lufs": lufs,
         "is_noise_profile": _is_noise_profile,
         "format_issues": [],
+        # v8 row fields
+        "true_peak_dbtp": true_peak_dbtp,
+        "speech_level_dba": speech_level_dba,
+        "channel_count": info["channels"] if isinstance(info["channels"], int) else None,
     }
 
     # Classification (noise profiles get "reference" disposition)
@@ -1013,6 +1201,8 @@ def build_report_lines(results: list[dict],
     """Generate report lines. Config drives threshold display and flagging."""
     if config is None:
         config = DEFAULT_CONFIG
+    if config.get("readout") == "platform":
+        return build_platform_report_lines(results, config)   # v8: platform blocks
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total = len(results)
@@ -1020,10 +1210,12 @@ def build_report_lines(results: list[dict],
     profile = config.get("profile_name", "Custom")
 
     lines = [
-        f"INTAKE SCAN v7.0 — {total} files",
+        f"INTAKE SCAN v{REPORT_VERSION} — {total} files",
         f"Profile: {profile}",
         f"Generated: {timestamp}",
         f"Noise floor / SNR: A-weighted (IEC 61672)",
+        # v8: stated once here; each JSONL row carries the reasons.
+        RT60_DRIFT_HEADER_LINE,
         _build_snr_threshold_line(config),
         _build_lufs_threshold_line(config),
         # Only the lower bounds (over-compression) are displayed. Upper-bound
@@ -1134,6 +1326,12 @@ def build_report_lines(results: list[dict],
             nf = rr.get("noise_floor_db", float('nan'))
             nf_str = f"{nf:+.1f} dBA" if not np.isnan(nf) else "N/A"
             lines.append(f"Noise profile: {rr['rel_path']} — baseline {nf_str}")
+        # v8: a take of digital silence keeps v7's line (its floor is what was
+        # measured) and gains this one, so nobody reads that baseline as a room.
+        for rr in ref_results:
+            if (rr.get("noise_reference") or {}).get("gate_reason") == "digital_silence":
+                lines.append(f"Noise take not used: {Path(rr['rel_path']).as_posix()} — digital silence, "
+                             f"not a room; its folder reads as having no noise take")
 
     # Peak divergence summary — show highest/lowest files and outlier count
     peak_content = [r for r in content
@@ -1172,7 +1370,9 @@ def build_report_lines(results: list[dict],
         disp = _DISPOSITION_LABELS.get(r.get("disposition", "pass"), "PASS")
         _is_np = r.get("is_noise_profile", False)
 
-        lines.append(f"FILE: {r['path']}")
+        # v8: relative to the scanned folder. An absolute path can carry
+        # names that do not belong in a report.
+        lines.append(f"FILE: {Path(r['rel_path']).as_posix()}")
         lines.append(f"Disposition: {disp}")
         fmt_issues = r.get("format_issues", [])
         if fmt_issues:
@@ -1264,3 +1464,857 @@ def write_text_report(results: list[dict], output_path: Path,
         config = DEFAULT_CONFIG
     lines = build_report_lines(results, bias_db=bias_db, config=config)
     output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+# ------------------------------------------------------------
+# v8: the folder scan
+# v7 ran these steps inside the GUI's run_scan. They moved here so the JSONL
+# rows and the tests run the same path as the app. The GUI keeps the display
+# and the Finder labels.
+# ------------------------------------------------------------
+AUDIO_EXTENSIONS = {".wav", ".m4a", ".mp3", ".aiff", ".flac", ".aac"}
+
+# The noise core's gate reasons that mean the noise take itself is unusable.
+# Anything else (no reason, or an SNR band) means the core accepted the take.
+_NOISE_TAKE_REJECT_REASONS = ("format_fail", "short_recording", "insufficient_clean_noise")
+
+
+def check_noise_take(file_path: Path, root_dir: Path, found_by: str, policy: dict = None) -> dict:
+    """The noise core's own verdict on a noise take. Under Default
+    and Strict it only labels the rows: they keep v7's whole-file floor whatever
+    it says. policy: the noise core policy to judge under (None = its default;
+    Platform Band passes its own).
+
+    The core's gate checks the format, a take of at least 3 s and a continuous
+    clean run of at least 3 s, then an SNR band. The band needs a speech level
+    and plays no part here, so any level will do and 0.0 is passed. Only the
+    three reasons above count as the core rejecting the take. write_outputs is
+    False, so the core writes no file next to the audio and no log line.
+    """
+    check = {
+        "rel_path": Path(file_path).relative_to(root_dir).as_posix(),
+        "found_by": found_by,          # "name" or "content_scan"
+        "accepted": False,
+        "gate_reason": None,           # set only when the core rejects the take
+        "valid_noise_sec": None,
+        "impulse_count": None,
+        "clean_run_floor_dba": None,   # the floor on the longest clean run
+    }
+    try:
+        record = noise_core.scan_noise_profile(Path(file_path), modality="audition",
+                                               speech_level_dba=0.0, config=policy,
+                                               write_outputs=False)
+        reason = record.get("gate_reason")
+        check["accepted"] = reason not in _NOISE_TAKE_REJECT_REASONS
+        if not check["accepted"]:
+            check["gate_reason"] = reason
+        if reason != "format_fail":
+            # The record leaves these two out, so ask the function the gate used.
+            data, sr = noise_core.load_audio(Path(file_path))
+            windows = noise_core.analyze_noise_windows(data, sr, policy or noise_core.load_config())
+            check["valid_noise_sec"] = windows["valid_noise_sec"]
+            check["impulse_count"] = windows["impulse_count"]
+            check["clean_run_floor_dba"] = windows["noise_floor_dba"]
+    except Exception:
+        check["accepted"] = False
+        check["gate_reason"] = "unreadable"   # the noise core could not read the file
+    # v8: the scanner's own rule on top of the core's gate. The core accepts digital
+    # silence as the quietest room there is; the scanner never uses it.
+    if check["accepted"] and is_digital_silence_take(file_path):
+        check["accepted"] = False
+        check["gate_reason"] = "digital_silence"
+    return check
+
+
+def _error_result(file_path: Path, root_dir: Path, error: Exception) -> dict:
+    """The result v7's run_scan recorded for a file that failed to scan.
+    v8: the message drops the scanned folder's absolute path."""
+    message = str(error).replace(str(root_dir) + os.sep, "")
+    return {
+        "path": file_path,
+        "rel_path": file_path.relative_to(root_dir),
+        "duration": 0.0,
+        "sample_rate": "?",
+        "global_dbtp": float('-inf'),
+        "events": [f"ERROR → {message}"],
+        "has_clip": False,
+        "worst_dbtp": -99.0,
+        "channels": "?",
+        "bit_depth": "?",
+        "noise_floor_db": float('nan'),
+        "noise_floor_source": "unavailable",
+        "crest_factor_db": float('nan'),
+        "rms_db": float('nan'),
+        "snr_db": float('nan'),
+        "lufs": float('nan'),
+        "is_noise_profile": False,
+        "format_issues": [],
+        "error": True,
+        "disposition": "reject",
+        "true_peak_dbtp": float('nan'),
+        "speech_level_dba": float('nan'),
+        "channel_count": None,
+    }
+
+
+def _noise_reference_for(result: dict, file_path: Path, root_dir: Path,
+                         folder_takes: dict) -> dict | None:
+    """The noise core's check of the take this row's floor came from, or None."""
+    if result.get("is_noise_profile"):
+        take = folder_takes.get(file_path.parent)
+        if take is not None and take["rel_path"] == file_path.relative_to(root_dir).as_posix():
+            return take
+        # A second noise-named file in the same folder: check it on its own.
+        found_by = "name" if is_noise_profile(file_path) else "content_scan"
+        return check_noise_take(file_path, root_dir, found_by)
+    if result.get("noise_floor_source") == "reference":
+        return folder_takes.get(file_path.parent)
+    return None
+
+
+def scan_folder(folder_path: Path, config: dict = None, bias_db: float = 0.0,
+                progress=None) -> list[dict]:
+    """Scan every audio file under folder_path and return one result per file.
+
+    The steps v7's GUI ran in run_scan: find each folder's noise take, measure
+    its floor, scan every file against it, then flag peak outliers. Writing the
+    reports and setting Finder labels stay with the caller.
+
+    v8 adds two things. A noise take found by content scan is scanned as a noise
+    take, not as a content file against its own floor. And
+    each noise take is checked by the noise core, so every row can say how far
+    to trust its floor (result["noise_reference"]).
+
+    bias_db: 0.0 unless the operator ticks the bias toggle (-0.10), as in v7.
+    progress: optional callable(text, tag) that receives v7's live log lines.
+    """
+    def say(text, tag=None):
+        if progress is not None:
+            progress(text, tag)
+
+    folder_path = Path(folder_path)
+    if config is None:
+        config = DEFAULT_CONFIG
+    if config.get("readout") == "platform":
+        return scan_folder_platform(folder_path, config, progress=progress)
+
+    files = sorted(
+        f for f in folder_path.rglob("*")
+        if f.suffix.lower() in AUDIO_EXTENSIONS and f.is_file()
+    )
+    if not files:
+        say("No supported audio files found.\n", "yellow")
+        return []
+    say(f"Found {len(files)} audio files — analyzing...\n")
+
+    # Pre-pass: find and measure each folder's noise take. find_noise_profiles()
+    # tries the name first, then the lowest-crest-factor WAV or FLAC at or below 14.65 dB.
+    folder_noise_floors = {}   # folder -> reference floor (dBA)
+    folder_takes = {}          # folder -> the noise core's check of that take
+    detected = find_noise_profiles(folder_path)
+    for parent, (profile_path, method) in detected.items():
+        try:
+            nf_db = measure_reference_noise_floor(profile_path)
+            folder_noise_floors[parent] = nf_db
+            rel = profile_path.relative_to(folder_path)
+            method_label = "name match" if method == "name" else "content scan"
+            say(f"Noise profile ({method_label}): {rel} — baseline {nf_db:+.1f} dBA\n", "blue")
+        except Exception as e:
+            say(f"Failed to measure noise profile {profile_path.name}: {e}\n", "yellow")
+            continue
+        found_by = "name" if method == "name" else "content_scan"
+        folder_takes[parent] = check_noise_take(profile_path, folder_path, found_by)
+    if not folder_noise_floors:
+        say("No noise profile files found — using per-file noise estimation\n", "yellow")
+
+    results = []
+    for i, file_path in enumerate(files, 1):
+        say(f"[{i:3}/{len(files)}] {file_path.relative_to(folder_path)}\n")
+        # v8: the folder's chosen noise take is a noise take however it was found.
+        chosen = detected.get(file_path.parent)
+        noise_take = is_noise_profile(file_path) or (chosen is not None and chosen[0] == file_path)
+        # A noise take is measured whole; every other file uses its folder's floor.
+        ref_nf = None if noise_take else folder_noise_floors.get(file_path.parent)
+        try:
+            result = scan_file(file_path, root_dir=folder_path,
+                               bias_db=bias_db, config=config,
+                               reference_noise_floor_db=ref_nf,
+                               noise_take=noise_take)
+        except Exception as e:
+            result = _error_result(file_path, folder_path, e)
+            say(f"   {result['events'][0]}\n", "red")
+        result["noise_reference"] = _noise_reference_for(result, file_path, folder_path, folder_takes)
+        if (result["noise_reference"] or {}).get("gate_reason") == "digital_silence":
+            say(f"   noise take of digital silence — not used\n", "yellow")
+        results.append(result)
+
+    # Flag peak outliers before report generation
+    flag_peak_outliers(results)
+    return results
+
+
+def scan_folder_platform(folder_path: Path, config: dict, progress=None) -> list[dict]:
+    """Platform Band: what Rec QC stages 1 and 2 would say about each
+    file. For every content file, the platform's two public calls with the same
+    argument shapes:
+
+        level = level_core.scan_phrase(file, write_outputs=False)
+        noise = noise_core.scan_noise_profile(take, modality="audition",
+                    speech_level_dba=level["speech_level_dba"],
+                    config=<the pointed policy>, write_outputs=False)
+
+    modality "audition" and write_outputs False are the two deliberate
+    differences from the platform's call: nothing is written next to client
+    audio and the cores' central logs stay untouched. The records
+    are kept as they are (result["platform"]); the scanner re-implements no rule.
+
+    The scanner's own pass still runs for what the cores lack (format, clip
+    timecodes, crest factor, peak outliers) and is informational here: a format
+    issue is shown, but the file is still read out. The bias toggle is inert,
+    because the platform has no bias. A folder with no noise take gets no band;
+    its per-file estimate is shown with low confidence.
+    """
+    def say(text, tag=None):
+        if progress is not None:
+            progress(text, tag)
+
+    folder_path = Path(folder_path)
+    noise_policy = config["noise_policy"]
+    # The scanner's own pass needs v7's config shape. Its editing sort is
+    # discarded below.
+    own_config = _deep_copy_dict(DEFAULT_CONFIG)
+
+    files = sorted(
+        f for f in folder_path.rglob("*")
+        if f.suffix.lower() in AUDIO_EXTENSIONS and f.is_file()
+    )
+    if not files:
+        say("No supported audio files found.\n", "yellow")
+        return []
+    say(f"Found {len(files)} audio files — analyzing...\n")
+
+    # Each folder's noise take, found as v7 finds a reference (name, then content),
+    # and the noise core's own check of it under the Platform Band policy.
+    takes = {}   # folder -> (take path, check)
+    for parent, (take_path, method) in find_noise_profiles(folder_path).items():
+        found_by = "name" if method == "name" else "content_scan"
+        check = check_noise_take(take_path, folder_path, found_by, policy=noise_policy)
+        takes[parent] = (take_path, check)
+        floor = check["clean_run_floor_dba"]
+        floor_text = f"clean run {floor:+.1f} dBA" if floor is not None else "no clean run"
+        method_label = "name match" if method == "name" else "content scan"
+        say(f"Noise take ({method_label}): {take_path.relative_to(folder_path)} — {floor_text}\n", "blue")
+    if not takes:
+        say("No noise take found — no band; per-file estimates shown with low confidence\n", "yellow")
+
+    results = []
+    for i, file_path in enumerate(files, 1):
+        say(f"[{i:3}/{len(files)}] {file_path.relative_to(folder_path)}\n")
+        take = takes.get(file_path.parent)
+        is_take = is_noise_profile(file_path) or (take is not None and take[0] == file_path)
+        platform = {"is_take": is_take, "take": take[1] if take else None,
+                    "level": None, "noise": None}
+        try:
+            if is_take:
+                if take is None or take[0] != file_path:
+                    # A second noise-named file in the folder: check it on its own.
+                    platform["take"] = check_noise_take(file_path, folder_path, "name",
+                                                        policy=noise_policy)
+                result = scan_file(file_path, root_dir=folder_path, bias_db=0.0,
+                                   config=own_config, noise_take=True)
+            else:
+                platform["level"] = level_core.scan_phrase(file_path, write_outputs=False)
+                if take is not None:
+                    platform["noise"] = noise_core.scan_noise_profile(
+                        take[0], modality="audition",
+                        speech_level_dba=platform["level"]["speech_level_dba"],
+                        config=noise_policy, write_outputs=False)
+                # The scanner's own pass, measured against the platform's floor if any.
+                floor = platform["noise"]["noise_floor_dba"] if platform["noise"] else None
+                result = scan_file(file_path, root_dir=folder_path, bias_db=0.0,
+                                   config=own_config, reference_noise_floor_db=floor,
+                                   noise_take=False)
+        except Exception as e:
+            result = _error_result(file_path, folder_path, e)
+            say(f"   {result['events'][0]}\n", "red")
+            platform = {"is_take": False, "take": None, "level": None, "noise": None}
+        result["platform"] = platform
+        result["disposition"] = None        # the editing sort does not apply here
+        result["noise_reference"] = None
+        results.append(result)
+
+    flag_peak_outliers(results)
+    return results
+
+
+# ------------------------------------------------------------
+# v8: rows and the JSONL report
+# ------------------------------------------------------------
+def _json_safe(value):
+    """Strict-JSON form: NaN and infinities become null, paths become POSIX
+    strings, numpy scalars become plain Python values."""
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, Path):
+        return value.as_posix()
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+    return value
+
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def noise_floor_method(result: dict) -> tuple[str, str]:
+    """(noise_floor_method, noise_floor_confidence) for one result.
+
+    high:   the floor is a noise take found by name, and the noise core accepts it
+    medium: the same, for a take found by content scan
+    low:    the per-file quiet-window estimate, or a take the core rejects (Default and
+            Strict still sort on it, as v7 did)
+    none:   no floor at all
+    """
+    if result.get("error") or result.get("skipped"):
+        return "unavailable", "none"
+    source = result.get("noise_floor_source", "unavailable")
+    if source in ("reference", "full-file"):
+        take = result.get("noise_reference")
+        if take is not None and take.get("gate_reason") == "digital_silence":
+            return "noise_take_full_file", "none"      # measured, but not a room
+        if take is None or not take["accepted"]:
+            return "noise_take_full_file", "low"
+        return "noise_take_full_file", ("high" if take["found_by"] == "name" else "medium")
+    if source == "per-file":
+        return "per_file_quiet_window", "low"
+    return "unavailable", "none"
+
+
+def _policy(config: dict) -> dict:
+    """The policy object on every row and on the run record."""
+    return {
+        "profile": config.get("profile_name", "Custom"),
+        "scanner_config_sha256": noise_core.config_sha256(config),
+        "level_config_sha256": None,     # Platform Band only
+        "band_config_sha256": None,      # Platform Band only
+    }
+
+
+def build_rows(results: list[dict], config: dict = None) -> list[dict]:
+    """One JSONL row per result: relative paths only, the noise-floor
+    method and confidence, the policy hashes, and RT60 and drift as n/a."""
+    if config is None:
+        config = DEFAULT_CONFIG
+    if config.get("readout") == "platform":
+        return build_platform_rows(results, config)
+    policy = _policy(config)
+    rows = []
+    for r in results:
+        method, confidence = noise_floor_method(r)
+        take = r.get("noise_reference")
+        uses_take = take is not None and method == "noise_take_full_file"
+        is_take = bool(r.get("is_noise_profile"))
+        if r.get("error"):
+            role = "error"
+        elif r.get("skipped"):
+            role = "skipped"
+        else:
+            role = "noise_take" if is_take else "content"
+        events = [e for e in r.get("events", [])
+                  if e not in ("CLEAN", "SKIPPED") and not e.startswith("ERROR")]
+        rows.append(_json_safe({
+            "record": "file",
+            # Identity
+            "rel_path": Path(r["rel_path"]).as_posix(),
+            "role": role,
+            # Format
+            "bit_depth": _int_or_none(r.get("bit_depth")),
+            "channels": r.get("channel_count"),
+            "sample_rate": _int_or_none(r.get("sample_rate")),
+            "duration_sec": r.get("duration"),
+            "format_issues": list(r.get("format_issues", [])),
+            # Measures
+            "sample_peak_dbfs": r.get("global_dbtp"),
+            "true_peak_dbtp": r.get("true_peak_dbtp"),
+            "true_peak_events": events,
+            "integrated_lufs": r.get("lufs"),
+            "crest_factor_db": r.get("crest_factor_db"),
+            "rms_dbfs": r.get("rms_db"),
+            "speech_level_dba": r.get("speech_level_dba"),
+            "noise_floor_dba": r.get("noise_floor_db"),
+            "snr_db": None if is_take else r.get("snr_db"),   # meaningless on the take itself
+            # Noise method
+            "noise_floor_method": method,
+            "noise_floor_confidence": confidence,
+            "noise_reference_rel_path": take["rel_path"] if uses_take else None,
+            "noise_reference_found_by": take["found_by"] if uses_take else None,
+            "noise_reference_gate_reason": take["gate_reason"] if uses_take else None,
+            "valid_noise_sec": take["valid_noise_sec"] if uses_take else None,
+            "impulse_count": take["impulse_count"] if uses_take else None,
+            # Editing sort (Default, Strict)
+            "disposition": r.get("disposition"),
+            "flags": [] if is_take else sorted(disposition_flags(r, config)),
+            "peak_outlier": bool(r.get("peak_outlier", False)),
+            # Platform readout (Platform Band only)
+            "level_verdict": None,
+            "peak_disposition": None,
+            "lufs_disposition": None,
+            "level_fail_reasons": None,
+            "noise_band": None,
+            "noise_verdict": None,
+            "noise_gate_reason": None,
+            # Policy
+            "policy": policy,
+            # Not applicable: always present, never left out
+            "rt60_status": "n/a",
+            "rt60_reason": RT60_REASON,
+            "drift_status": "n/a",
+            "drift_reason": DRIFT_REASON,
+        }))
+    return rows
+
+
+def _platform_policy(config: dict, level_rec: dict = None, noise_rec: dict = None) -> dict:
+    """The policy object under Platform Band. The hashes are copied
+    from the cores' records; a row without a record gets the same core function
+    over the same policy, so the value is the one the record would carry."""
+    noise_policy = config["noise_policy"]
+    return {
+        "profile": noise_policy.get("profile_name", config.get("profile_name")),
+        "scanner_config_sha256": None,
+        "level_config_sha256": (level_rec["thresholds"]["config_sha256"] if level_rec
+                                else level_core.config_sha256(config["level_policy"])),
+        "band_config_sha256": (noise_rec["thresholds"]["config_sha256"] if noise_rec
+                               else noise_core.config_sha256(noise_policy)),
+    }
+
+
+def _take_confidence(take: dict) -> str:
+    """high or medium for a take the noise core accepts; none when it rejects it."""
+    if take is None or not take["accepted"]:
+        return "none"
+    return "high" if take["found_by"] == "name" else "medium"
+
+
+def platform_noise_method(result: dict) -> tuple[str, str]:
+    """(noise_floor_method, noise_floor_confidence) under Platform Band.
+    The floor is the noise core's clean run; a take the core rejects gives no
+    floor (none); a folder with no take falls back to the per-file estimate
+    (low, no band)."""
+    p = result.get("platform") or {}
+    if result.get("error"):
+        return "unavailable", "none"
+    if p.get("is_take"):
+        return "noise_take_clean_run", _take_confidence(p.get("take"))
+    if p.get("take") is not None:
+        noise = p.get("noise")
+        if noise is None or noise.get("gate_reason") in _NOISE_TAKE_REJECT_REASONS:
+            return "noise_take_clean_run", "none"
+        return "noise_take_clean_run", ("high" if p["take"]["found_by"] == "name" else "medium")
+    if result.get("noise_floor_source") == "per-file":
+        return "per_file_quiet_window", "low"
+    return "unavailable", "none"
+
+
+def build_platform_rows(results: list[dict], config: dict) -> list[dict]:
+    """Rows under Platform Band: the same fields as build_rows, with the
+    platform readout copied from the two cores' records. The editing sort
+    does not apply, so disposition is null and flags are empty."""
+    rows = []
+    for r in results:
+        p = r.get("platform") or {}
+        level, noise, take = p.get("level"), p.get("noise"), p.get("take")
+        method, confidence = platform_noise_method(r)
+        if r.get("error"):
+            role = "error"
+        elif p.get("is_take"):
+            role = "noise_take"
+        elif level is not None:
+            role = "content"     # read out even with a format issue (informational)
+        else:
+            role = "skipped"
+        if p.get("is_take"):
+            floor, snr = (take or {}).get("clean_run_floor_dba"), None
+        elif noise is not None:
+            floor, snr = noise.get("noise_floor_dba"), noise.get("snr_db")
+        else:
+            floor, snr = r.get("noise_floor_db"), r.get("snr_db")    # the per-file estimate
+        uses_take = take is not None and method == "noise_take_clean_run"
+        events = [e for e in r.get("events", [])
+                  if e not in ("CLEAN", "SKIPPED") and not e.startswith("ERROR")]
+        rows.append(_json_safe({
+            "record": "file",
+            # Identity
+            "rel_path": Path(r["rel_path"]).as_posix(),
+            "role": role,
+            # Format
+            "bit_depth": _int_or_none(r.get("bit_depth")),
+            "channels": r.get("channel_count"),
+            "sample_rate": _int_or_none(r.get("sample_rate")),
+            "duration_sec": r.get("duration"),
+            "format_issues": list(r.get("format_issues", [])),
+            # Measures: the level record's where there is one
+            "sample_peak_dbfs": level["sample_peak_dbfs"] if level else r.get("global_dbtp"),
+            "true_peak_dbtp": level["true_peak_dbtp"] if level else r.get("true_peak_dbtp"),
+            "true_peak_events": events,
+            "integrated_lufs": level["integrated_lufs"] if level else None,
+            "crest_factor_db": level["crest_factor_db"] if level else r.get("crest_factor_db"),
+            "rms_dbfs": r.get("rms_db"),
+            "speech_level_dba": level["speech_level_dba"] if level else None,
+            "noise_floor_dba": floor,
+            "snr_db": snr,
+            # Noise method
+            "noise_floor_method": method,
+            "noise_floor_confidence": confidence,
+            "noise_reference_rel_path": take["rel_path"] if uses_take else None,
+            "noise_reference_found_by": take["found_by"] if uses_take else None,
+            "noise_reference_gate_reason": take["gate_reason"] if uses_take else None,
+            "valid_noise_sec": take["valid_noise_sec"] if uses_take else None,
+            "impulse_count": take["impulse_count"] if uses_take else None,
+            # Editing sort: not applicable under Platform Band
+            "disposition": None,
+            "flags": [],
+            "peak_outlier": bool(r.get("peak_outlier", False)),
+            # Platform readout, copied from the records
+            "level_verdict": level["verdict"] if level else None,
+            "peak_disposition": level["peak_disposition"] if level else None,
+            "lufs_disposition": level["lufs_disposition"] if level else None,
+            "level_fail_reasons": level["fail_reasons"] if level else None,
+            "noise_band": noise["disposition"] if noise else None,
+            "noise_verdict": noise["verdict"] if noise else None,
+            "noise_gate_reason": noise["gate_reason"] if noise else None,
+            # Policy
+            "policy": _platform_policy(config, level, noise),
+            # Not applicable: always present, never left out
+            "rt60_status": "n/a",
+            "rt60_reason": RT60_REASON,
+            "drift_status": "n/a",
+            "drift_reason": DRIFT_REASON,
+        }))
+    return rows
+
+
+def build_run_record(results: list[dict], config: dict = None, bias_db: float = 0.0) -> dict:
+    """The first JSONL line: when and how the scan ran, the policy
+    hashes, and the vendored core files it ran on."""
+    if config is None:
+        config = DEFAULT_CONFIG
+    platform = config.get("readout") == "platform"
+    versions = {"level_check_phrase_core.py": level_core.SCANNER_VERSION,
+                "noise_profile_scanner_core.py": noise_core.SCANNER_VERSION}
+    vendored = [{"path": e["path"], "version": versions.get(e["path"]),
+                 "repo": e["repo"], "commit": e["commit"], "sha256": e["sha256"]}
+                for e in load_manifest(CORES_DIR)["files"]]
+    return _json_safe({
+        "record": "run",
+        "schema_version": ROWS_SCHEMA_VERSION,
+        "scanner_version": SCANNER_VERSION,
+        "scanned_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "profile": config.get("profile_name", "Custom"),
+        "readout": "platform" if platform else "editing",
+        "policy": _platform_policy(config) if platform else _policy(config),
+        # The bias toggle is inert under Platform Band: the platform has no bias.
+        "bias_db": 0.0 if platform else bias_db,
+        "file_count": len(results),
+        "vendored": vendored,
+        "rt60_status": "n/a",
+        "rt60_reason": RT60_REASON,
+        "drift_status": "n/a",
+        "drift_reason": DRIFT_REASON,
+    })
+
+
+def _platform_tier(r: dict) -> int:
+    """Report order under Platform Band: a file that fails either stage, then
+    WARN, CAUTION, PASS, files with no band, noise takes, errors."""
+    p = r.get("platform") or {}
+    if r.get("error"):
+        return 6
+    if p.get("is_take"):
+        return 5
+    level, noise = p.get("level"), p.get("noise")
+    if (level and level["verdict"] == "FAIL") or (noise and noise["disposition"] == "REJECT"):
+        return 0
+    if noise is None:
+        return 4
+    return {"WARN": 1, "CAUTION": 2, "PASS": 3}.get(noise["disposition"], 4)
+
+
+def _across(label: str, values: list, unit: str) -> str:
+    """One 'across files' header line in v7's shape."""
+    return (f"{label} across files: worst {max(values):+.1f} {unit} / best {min(values):+.1f} {unit} / "
+            f"median {np.median(values):+.1f} {unit}")
+
+
+def build_platform_report_lines(results: list[dict], config: dict) -> list[str]:
+    """The text report under Platform Band: a header
+    with the bands and level-check lines read from the cores, their policy
+    hashes and the counts, then one block per file, failing files first. The
+    lines the sibling harnesses parse keep v7's shapes (FILE:, RMS:, SNR:,
+    Noise floor:, Highest measured peak:, LUFS:, TRUE PEAK, baseline ... dBA)."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    noise_policy, level_policy = config["noise_policy"], config["level_policy"]
+    snr, peak, loud = noise_policy["snr"], level_policy["peak"], level_policy["lufs"]
+    band_hash = noise_core.config_sha256(noise_policy)[:8]
+    level_hash = level_core.config_sha256(level_policy)[:8]
+
+    read_out = [r for r in results if (r.get("platform") or {}).get("level")]
+    bands = {}
+    for r in read_out:
+        noise = r["platform"]["noise"]
+        key = noise["disposition"] if noise else "no band"
+        bands[key] = bands.get(key, 0) + 1
+    verdicts = {"PASS": 0, "FAIL": 0}
+    for r in read_out:
+        verdicts[r["platform"]["level"]["verdict"]] += 1
+    n_hot = sum(1 for r in read_out if r["platform"]["level"]["peak_disposition"] == "HOT")
+    n_quiet = sum(1 for r in read_out if r["platform"]["level"]["lufs_disposition"] == "QUIET")
+
+    lines = [
+        f"INTAKE SCAN v{REPORT_VERSION} — {len(results)} files",
+        f"Profile: {config.get('profile_name', 'Platform Band')}",
+        f"Generated: {timestamp}",
+        "Noise floor / SNR: A-weighted (IEC 61672)",
+        RT60_DRIFT_HEADER_LINE,
+        "Platform readout: Rec QC stages 1 and 2, by the platform's own cores — bands and verdicts",
+        f"Noise bands: reject < {snr['reject_below']} dB | warn < {snr['warn_below']} dB | "
+        f"caution < {snr.get('caution_below', snr['warn_below'])} dB | pass ≥ {snr['pass_above']} dB "
+        f"(noise core policy \"{noise_policy.get('profile_name')}\", {band_hash})",
+        f"Level check: clip at ≥ {peak['clip_at_dbtp']} dBTP | hot above {peak['hot_above_dbfs']} dBFS | "
+        f"too quiet below {loud['too_quiet_below']} LUFS | quiet at or below {loud['quiet_below']} LUFS "
+        f"(level core policy \"{level_policy.get('profile_name')}\", {level_hash})",
+        f"Noise band: {bands.get('PASS', 0)} PASS / {bands.get('CAUTION', 0)} CAUTION / "
+        f"{bands.get('WARN', 0)} WARN / {bands.get('REJECT', 0)} REJECT / {bands.get('no band', 0)} no band",
+        f"Level verdict: {verdicts['PASS']} PASS / {verdicts['FAIL']} FAIL — flags {n_hot} HOT, {n_quiet} QUIET",
+    ]
+
+    n_err = sum(1 for r in results if r.get("error"))
+    if n_err:
+        lines.append(f"Errors: {n_err} file(s) could not be read")
+    with_issues = [r for r in read_out if r.get("format_issues")]
+    if with_issues:
+        lines.append(f"Format issues (informational under Platform Band): {len(with_issues)} file(s)")
+        for r in with_issues:
+            lines.append(f"  {Path(r['rel_path']).as_posix()} — {'; '.join(r['format_issues'])}")
+    if bands.get("no band"):
+        lines.append(f"{bands['no band']} file(s) without a folder noise take — no band; "
+                     f"per-file estimate shown with low confidence")
+
+    floors = [r["platform"]["noise"]["noise_floor_dba"] for r in read_out
+              if r["platform"]["noise"] and r["platform"]["noise"]["noise_floor_dba"] is not None]
+    snrs = [r["platform"]["noise"]["snr_db"] for r in read_out
+            if r["platform"]["noise"] and r["platform"]["noise"]["snr_db"] is not None]
+    lufs_values = [r["platform"]["level"]["integrated_lufs"] for r in read_out
+                   if r["platform"]["level"]["integrated_lufs"] is not None]
+    if floors:
+        lines.append(_across("Noise floor (clean run)", floors, "dBA"))
+    if snrs:
+        lines.append(f"SNR across files: worst {min(snrs):+.1f} dB / best {max(snrs):+.1f} dB / "
+                     f"median {np.median(snrs):+.1f} dB")
+    if lufs_values:
+        lines.append(f"LUFS across files: lowest {min(lufs_values):+.1f} LUFS / highest "
+                     f"{max(lufs_values):+.1f} LUFS / median {np.median(lufs_values):+.1f} LUFS")
+
+    for r in results:
+        p = r.get("platform") or {}
+        take = p.get("take")
+        if not p.get("is_take") or take is None:
+            continue
+        floor = take["clean_run_floor_dba"]
+        floor_text = f"baseline {floor:+.1f} dBA" if floor is not None else "no clean run"
+        clean = f"{take['valid_noise_sec']:.1f} s" if take["valid_noise_sec"] is not None else "n/a"
+        silent = take["gate_reason"] == "digital_silence"
+        verdict = ("accepted by the noise core" if take["accepted"]
+                   else "digital silence, not used" if silent
+                   else f"rejected by the noise core ({take['gate_reason']})")
+        lines.append(f"Noise profile: {Path(r['rel_path']).as_posix()} — {floor_text} "
+                     f"(clean run {clean}, {take['impulse_count']} impulse(s), "
+                     f"found by {take['found_by'].replace('_', ' ')}, {verdict})")
+        if silent:   # a deliberate difference from the platform's core
+            lines.append(f"Noise take not used: {Path(r['rel_path']).as_posix()} — digital silence, "
+                         f"not a room; its folder reads as having no noise take")
+
+    lines.append("=" * 80)
+    lines.append("")
+
+    for r in sorted(results, key=lambda x: (_platform_tier(x), -x.get("worst_dbtp", -99.0))):
+        p = r.get("platform") or {}
+        level, noise, take = p.get("level"), p.get("noise"), p.get("take")
+        lines.append(f"FILE: {Path(r['rel_path']).as_posix()}")
+
+        if r.get("error"):
+            lines.append("Platform: not read out (error)")
+            lines.extend(f"   {e}" for e in r["events"])
+            lines.append(">>> ERROR")
+            lines.append("-" * 80)
+            lines.append("")
+            continue
+
+        if p.get("is_take"):
+            state = ("accepted by the noise core" if take and take["accepted"]
+                     else "digital silence, not used by the scanner"
+                     if take and take["gate_reason"] == "digital_silence"
+                     else f"rejected ({take['gate_reason']}) by the noise core" if take
+                     else "not checked by the noise core")
+            lines.append(f"Platform: noise take — {state}")
+        else:
+            band = noise["disposition"] if noise else "no band"
+            flags = [d for d in (level["peak_disposition"], level["lufs_disposition"]) if d != "PASS"]
+            lines.append(f"Platform: noise {band} | level {level['verdict']}"
+                         + (f" ({', '.join(flags)})" if flags else ""))
+
+        issues = r.get("format_issues", [])
+        lines.append(f"Format: {r['bit_depth']}-bit | {r['channels']} | {r['sample_rate']} Hz"
+                     + (f"  (informational) — {'; '.join(issues)}" if issues else ""))
+        lines.append(f"Duration: {sec_to_timecode(r['duration'])}")
+        sample_peak = level["sample_peak_dbfs"] if level else r.get("global_dbtp", float('-inf'))
+        lines.append("Highest measured peak: "
+                     + (f"{sample_peak:+.2f} dBFS" if sample_peak not in (None, float('-inf')) else "N/A"))
+        true_peak = level["true_peak_dbtp"] if level else r.get("true_peak_dbtp")
+        lines.append(f"True peak:    {_fmt_db(true_peak if true_peak is not None else float('nan'), 'dBTP')}"
+                     " (whole file)")
+        lines.append(f"RMS:          {_fmt_db(r.get('rms_db', float('nan')), 'dBFS')}")
+
+        if p.get("is_take"):
+            floor = take["clean_run_floor_dba"] if take else None
+            lines.append("Noise floor:  "
+                         + (f"{floor:+.1f} dBA (clean run)" if floor is not None else "N/A (no clean run)"))
+        else:
+            crest = level["crest_factor_db"]
+            lines.append(f"Crest factor: {_fmt_db(crest if crest is not None else float('nan'))} (informational)")
+            if noise is not None:
+                floor, snr_db = noise["noise_floor_dba"], noise["snr_db"]
+                lines.append("Noise floor:  "
+                             + (f"{floor:+.1f} dBA (clean run)" if floor is not None
+                                else f"N/A ({noise['gate_reason']})"))
+                lines.append("SNR:          "
+                             + (f"{snr_db:+.1f} dB  [{noise['disposition']}]" if snr_db is not None
+                                else f"N/A  [{noise['disposition']}]"))
+            else:
+                floor, snr_db = r.get("noise_floor_db", float('nan')), r.get("snr_db", float('nan'))
+                lines.append(f"Noise floor:  {_fmt_db(floor, 'dBA (per-file estimate, low confidence)')}")
+                lines.append(f"SNR:          {_fmt_db(snr_db)}  (informational — no noise take, no band)")
+            lufs = level["integrated_lufs"]
+            lines.append("LUFS:         "
+                         + (f"{lufs:+.1f} LUFS  [{level['lufs_disposition']}]" if lufs is not None else "N/A"))
+            if r.get("peak_outlier"):
+                lines.append(f"PEAK:         [CAUTION] — {r.get('peak_delta_db', 0):.1f} dB below "
+                             f"folder max peak (informational)")
+
+        if r.get("skipped"):
+            lines.append("TRUE PEAK: timecodes not read (format issue)")
+        elif r["events"] != ["CLEAN"]:
+            lines.append("TRUE PEAK ✗")
+            lines.extend(f"   {e}" for e in r["events"])
+        else:
+            lines.append("TRUE PEAK ✓ CLEAN")
+
+        if p.get("is_take"):
+            lines.append(">>> NOISE TAKE")
+        else:
+            band = noise["disposition"] if noise else "no band"
+            lines.append(f">>> noise {band} | level {level['verdict']}")
+        lines.append("-" * 80)
+        lines.append("")
+
+    return lines
+
+
+def write_jsonl_report(results: list[dict], output_path: Path,
+                       bias_db: float = 0.0, config: dict = None):
+    """INTAKE_REPORT.jsonl: the run record, then one row per file. Strict JSON,
+    one object per line."""
+    if config is None:
+        config = DEFAULT_CONFIG
+    records = [build_run_record(results, config, bias_db)] + build_rows(results, config)
+    text = "".join(json.dumps(rec, ensure_ascii=False, allow_nan=False) + "\n" for rec in records)
+    Path(output_path).write_text(text, encoding="utf-8")
+
+
+# ------------------------------------------------------------
+# v8: Finder label colours. The GUI applies them; the mapping lives here so it
+# can be checked without opening a window.
+# Label indices: 0 none, 1 orange, 2 red, 3 yellow, 4 blue, 5 purple, 6 green, 7 gray
+# ------------------------------------------------------------
+def finder_label_index(r: dict, config: dict) -> int:
+    """The Finder label for one result. Default and Strict keep v7's mapping;
+    Platform Band has its own (see _platform_label_index)."""
+    if config.get("readout") == "platform":
+        return _platform_label_index(r)
+
+    disp = r.get("disposition", "pass")
+    if disp == "reject":
+        return 2  # Red
+    if disp == "reference":
+        return 7  # Gray — noise profile reference file
+    if disp == "pass":
+        if r.get("peak_outlier"):
+            return 4  # Blue
+        return 6  # Green
+
+    # Salvageable — check which flags are present to pick orange vs yellow
+    snr_db = r.get("snr_db", float('nan'))
+    cf_db = r.get("crest_factor_db", float('nan'))
+    lufs = r.get("lufs", float('nan'))
+    snr_cfg = config["snr"]
+    cf_cfg = config["crest_factor"]
+    loud_cfg = config.get("loudness", DEFAULT_CONFIG["loudness"])
+
+    has_critical = False
+    nf_source = r.get("noise_floor_source", "unavailable")
+    if not np.isnan(snr_db) and nf_source == "reference" and snr_db < snr_cfg["warn_below"]:
+        has_critical = True  # snr_warn level (reference-based only)
+    if not np.isnan(cf_db):
+        if cf_db <= cf_cfg["warn_low"] or cf_db >= cf_cfg["warn_high"]:
+            has_critical = True  # cf_warn level
+    if not np.isnan(lufs) and lufs != float('-inf'):
+        if lufs < loud_cfg.get("caution_below", loud_cfg.get("warn_below", -36.0)):
+            has_critical = True  # lufs_caution level
+
+    return 1 if has_critical else 3  # Orange if critical, Yellow if minor
+
+
+def _platform_label_index(r: dict) -> int:
+    """The default mapping:
+    red for a level FAIL or a noise REJECT, orange for WARN, yellow for CAUTION
+    or a level flag (HOT, QUIET), green for PASS on both, gray for the noise
+    take, and none when the folder has no noise take: an unanswered row never
+    shows green."""
+    if r.get("error"):
+        return 2
+    p = r.get("platform") or {}
+    if p.get("is_take"):
+        return 7
+    level, noise = p.get("level"), p.get("noise")
+    if level is None:
+        return 0
+    band = noise["disposition"] if noise else None
+    flagged = level["peak_disposition"] != "PASS" or level["lufs_disposition"] != "PASS"
+    if level["verdict"] == "FAIL" or band == "REJECT":
+        return 2
+    if band == "WARN":
+        return 1
+    if band == "CAUTION" or flagged:
+        return 3
+    if band == "PASS":
+        return 6
+    return 0
+
+
+def write_reports(results: list[dict], folder_path: Path,
+                  bias_db: float = 0.0, config: dict = None) -> tuple[Path, Path]:
+    """Write INTAKE_REPORT.txt and INTAKE_REPORT.jsonl into the scanned folder.
+    Returns both paths."""
+    folder_path = Path(folder_path)
+    report_path = folder_path / REPORT_NAME
+    rows_path = folder_path / ROWS_NAME
+    write_text_report(results, report_path, bias_db=bias_db, config=config)
+    write_jsonl_report(results, rows_path, bias_db=bias_db, config=config)
+    return report_path, rows_path

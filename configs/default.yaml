@@ -1,7 +1,9 @@
 # default.yaml — Relaxed intake thresholds
 # Thresholds can be tightened toward strict as collection improves.
 
-profile_name: "Default"
+# Shown as "v7" from v8 on: v8 opens on Platform Band, and this is v7's
+# editing sort (v7 called it Default). The file keeps its name so --profile default works.
+profile_name: "v7"
 
 # SNR thresholds (dB) — A-weighted (IEC 61672) as of v6.0
 # Calibrated against known-quality test corpus (April 2026)

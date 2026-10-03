@@ -3,4 +3,5 @@ scipy
 soundfile
 pydub
 pyloudnorm
+pyyaml
 tkinterdnd2

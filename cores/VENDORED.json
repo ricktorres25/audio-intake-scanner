@@ -1,0 +1,38 @@
+{
+  "written_by": "_vendor_check.py write",
+  "note": "Do not edit by hand. The scanner refuses to start if a file below differs from its sha256.",
+  "files": [
+    {
+      "path": "level_check_phrase_core.py",
+      "source_folder": "the platform's level-check core",
+      "source_path": "level_check_phrase_core.py",
+      "repo": "private",
+      "commit": "e36b6513c343c44f41b83e4e877af77a83cc7ec2",
+      "sha256": "69c69ca0ba14796f0bd8598980dddf13e710cfe9cdd642520434e933957bfa13"
+    },
+    {
+      "path": "noise_profile_scanner_core.py",
+      "source_folder": "the platform's noise-profile core",
+      "source_path": "noise_profile_scanner_core.py",
+      "repo": "private",
+      "commit": "3df3f51ad3f657d7db2b8fc59dce08e5b8242672",
+      "sha256": "70bc0c8e7e6fe640324654043c3002841a348ef402801e1ed6b72cf1b18754ba"
+    },
+    {
+      "path": "noise_profile_configs/platform_band.yaml",
+      "source_folder": "the noise-profile core's policies",
+      "source_path": "configs/platform_band.yaml",
+      "repo": "private",
+      "commit": "3df3f51ad3f657d7db2b8fc59dce08e5b8242672",
+      "sha256": "c0c441a07879858117fbb89385f8a734585530fb923964996b5fe6533c2289cb"
+    },
+    {
+      "path": "platform_tokens/tokens.css",
+      "source_folder": "the platform's design tokens",
+      "source_path": "tokens.css",
+      "repo": "private",
+      "commit": "bbbd006452e7486cfa713e920edc0bd090ba7d56",
+      "sha256": "65d40c61986c2f3ff59bd05d0dd529b16f6eceabd2bb6ae7e4656f0be68891e8"
+    }
+  ]
+}

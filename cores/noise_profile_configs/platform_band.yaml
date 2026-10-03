@@ -1,0 +1,22 @@
+# Noise Profile Scanner — Platform Band profile
+#
+# The collection platform's band policy for the noise stage. load_config() merges
+# this over DEFAULT_CONFIG, so only the value that moves is stated here.
+#
+# ONLY reject_below MOVES: 38.0 -> 20.0 dB A-weighted SNR. warn_below is held at 48.0.
+#
+# Resulting bands (A-weighted SNR = speech_level_dba - noise_floor_dba):
+#   SNR < 20.0        -> REJECT   (the stage fails)
+#   20.0 <= SNR < 48.0 -> WARN
+#   48.0 <= SNR < 55.0 -> CAUTION
+#   SNR >= 55.0       -> PASS
+#
+# SNR here is relative to the speech level the level check measures, so the level
+# check's pass window bounds the numerator of every SNR these bands classify.
+
+profile_name: "Platform Band"
+config_version: "1.2-platform-band"
+
+snr:
+  reject_below: 20.0   # was 38.0 — the only threshold this profile moves
+  # warn_below / caution_below / pass_above inherit DEFAULT_CONFIG (48.0 / 55.0 / 55.0)

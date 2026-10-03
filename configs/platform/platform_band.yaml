@@ -1,0 +1,21 @@
+# Platform Band: a POINTER profile.
+#
+# It holds no thresholds. The numbers live in the cores' own policy files, which
+# the noise core loads exactly as the platform loads them at boot. A missing file
+# stops the scan; there is no fallback to another policy.
+#
+# It lives in configs/platform/ so v7, which lists configs/*.yaml only, never
+# shows it.
+
+profile_name: "Platform Band"
+readout: "platform"            # default.yaml and strict.yaml have no such key
+
+cores:
+  # Relative to the scanner folder (the folder that holds cores/).
+  noise_profile_config: "cores/noise_profile_configs/platform_band.yaml"
+  # null = the level core's built-in policy, which is what the platform passes.
+  level_check_config: null
+
+# The per-file estimate for a folder with no noise take takes no settings from
+# here (estimate_quiet_floor in the core). It gives no band and never sets the
+# headline.

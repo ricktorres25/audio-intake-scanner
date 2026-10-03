@@ -1,5 +1,24 @@
-# intake_scanner_gui_v7.py
-# v7.0 changes:
+# intake_scanner_gui.py
+# v8.0 changes:
+# - Imports from intake_scanner_core. If the vendored cores fail their start
+#   check (or a package is missing), a dialog names the problem and the app quits.
+# - run_scan calls the core's scan_folder() and write_reports(): the scan steps
+#   moved into the core, and INTAKE_REPORT.jsonl is written beside the text report.
+# - The app opens on Platform Band, and --headless without --profile runs it.
+#   v7 (configs/default.yaml, the previous version's Default) and Strict stay in
+#   the dropdown.
+# - Platform Band in the dropdown (from configs/platform/). Under it the bias
+#   checkbox is disabled, the summary reads as noise band and level verdict
+#   counts, and a profile that fails to load stops the scan instead of falling
+#   back to Strict.
+# - Finder labels come from the core's finder_label_index(): v7's mapping for
+#   v7 and Strict, a band-based mapping for Platform Band.
+# - The platform skin: the platform's design tokens, read from
+#   cores/platform_tokens/tokens.css in the appearance macOS shows at launch;
+#   a plain dark look if they cannot be read.
+# - Version labels bumped to 8.0.
+#
+# v7.0 changes (preserved):
 # - Imports from intake_scanner_core_v7
 # - Pre-pass noise profile detection uses new find_noise_profiles() which
 #   returns {folder: (path, method)}; method logged as 'name match' or
@@ -26,20 +45,44 @@ import re
 import sys
 from pathlib import Path
 
-from intake_scanner_core import (
-    scan_file, write_text_report, build_report_lines,
-    load_config, list_builtin_profiles, get_builtin_config_dir,
-    flag_peak_outliers, DEFAULT_CONFIG,
-    is_noise_profile, find_noise_profiles, measure_reference_noise_floor,
-    load_audio, a_weight,
-)
+
+def _refuse_to_start(error: Exception):
+    """The scanner cannot run: say why in a dialog (the app has no console), then quit."""
+    message = f"Intake Scanner cannot start.\n\n{error}"
+    print(message, file=sys.stderr)
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox as _messagebox
+        _root = _tk.Tk()
+        _root.withdraw()
+        _messagebox.showerror("Intake Scanner", message)
+        _root.destroy()
+    except Exception:
+        pass
+    sys.exit(1)
+
+
+try:
+    # Importing the core imports the vendored cores, which runs their start check.
+    from intake_scanner_core import (
+        scan_folder, write_reports, build_report_lines,
+        load_config, list_builtin_profiles, get_builtin_config_dir,
+        DEFAULT_CONFIG, REPORT_VERSION, finder_label_index, CORES_DIR,
+    )
+except Exception as _start_error:      # VendoredCoreError, or a missing package
+    _refuse_to_start(_start_error)
+
+
+# v8: the app opens on Platform Band, and a headless run without --profile uses
+# it. v7 (configs/default.yaml) and Strict stay in the list.
+_STARTUP_PROFILE_STEM = "platform_band"
 
 
 def _resolve_config(profile_arg: str = None) -> dict:
     """Resolve a profile name or YAML path to a config dict.
-    Defaults to default profile when no profile is specified."""
+    Defaults to Platform Band when no profile is specified (v8)."""
     if profile_arg is None:
-        profile_arg = "default"
+        profile_arg = _STARTUP_PROFILE_STEM
 
     # If it looks like a file path, load it directly
     p = Path(profile_arg)
@@ -50,6 +93,15 @@ def _resolve_config(profile_arg: str = None) -> dict:
     for builtin in list_builtin_profiles():
         if profile_arg.lower() in builtin.stem.lower():
             return load_config(builtin)
+
+    # v8: or a profile's own name, so --profile v7 finds configs/default.yaml
+    for builtin in list_builtin_profiles():
+        try:
+            config = load_config(builtin)
+        except Exception:
+            continue
+        if config.get("profile_name", "").lower() == profile_arg.lower():
+            return config
 
     raise ValueError(f"Profile not found: {profile_arg}")
 
@@ -90,10 +142,89 @@ import queue
 import threading
 
 
+# -- Skin ---------------------------------------------------------------------
+# The platform's design tokens, read from the vendored copy of its tokens.css
+# (cores/platform_tokens/tokens.css, listed in cores/VENDORED.json), in the
+# appearance macOS shows at launch. Read once; there is no toggle. If anything is
+# missing, the window keeps a plain dark look and the log says why.
+
+# The five status hues. Dark keeps v7's values. Light takes darker versions that
+# hold hue and saturation, at the lightest value clearing 4.5:1 contrast on the
+# light --card. They are the scanner's own hues, not platform tokens.
+_STATUS_HUES = {
+    "dark":  {"green": "#00ff88", "red": "#ff6666", "orange": "#ff9933",
+              "yellow": "#ffdd44", "blue": "#66aaff"},
+    "light": {"green": "#008346", "red": "#e50000", "orange": "#b25900",
+              "yellow": "#876f00", "blue": "#006bf0"},
+}
+_SKIN_TOKENS = ("--paper", "--card", "--line", "--ink", "--ink-soft", "--accent", "--accent-fill")
+_ROUNDED_BUTTON = True    # rounded corners on the scan button; set False if they misbehave
+
+
+def _system_appearance() -> str:
+    """'dark' or 'light': the macOS appearance at launch."""
+    import subprocess
+    try:
+        style = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"],
+                               capture_output=True, text=True, timeout=2).stdout.strip()
+    except Exception:
+        return "light"
+    return "dark" if style.lower() == "dark" else "light"
+
+
+def _load_skin():
+    """(skin, problem). skin maps paper, card, line, ink, ink_soft, accent,
+    accent_fill and the five hues to this launch's colours; None, with the
+    reason, when the tokens cannot be read."""
+    try:
+        css = (CORES_DIR / "platform_tokens" / "tokens.css").read_text(encoding="utf-8")
+    except OSError:
+        return None, "cores/platform_tokens/tokens.css is missing"
+    # Strip comments first: the file's header comment names the dark selector too.
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+
+    def rule(selector):
+        start = css.find(selector + " {")
+        if start < 0:
+            return {}
+        body = css[css.index("{", start) + 1:css.index("}", start)]
+        return {k: v.strip() for k, v in re.findall(r"(--[\w-]+)\s*:\s*([^;]+);", body)}
+
+    theme = _system_appearance()
+    tokens = rule(":root")
+    if theme == "dark":
+        tokens.update(rule('html[data-theme="dark"]'))
+    bad = [t for t in _SKIN_TOKENS if not re.fullmatch(r"#[0-9a-fA-F]{6}", tokens.get(t, ""))]
+    if bad:
+        return None, f"tokens.css has no usable {', '.join(bad)} for the {theme} appearance"
+    skin = {t[2:].replace("-", "_"): tokens[t] for t in _SKIN_TOKENS}
+    skin.update(_STATUS_HUES[theme])
+    skin["theme"] = theme
+    return skin, None
+
+
+SKIN, SKIN_PROBLEM = _load_skin()
+
+# The colours the window uses: a plain dark look, replaced by the skin when it loads.
+LOOK = {
+    "window": "#1e1e1e", "title": "#00ffaa", "frame": "#0a0a0a", "panel": "#0d0d0d",
+    "panel_text": "#d4d4d4", "text": "#ffffff", "muted": "#888888", "label": "#aaaaaa",
+    "footer": "#666666", "log_title": "#00ffaa",
+    "green": "#00ff88", "red": "#ff6666", "orange": "#ff9933", "yellow": "#ffdd44", "blue": "#66aaff",
+}
+if SKIN:
+    LOOK.update({
+        "window": SKIN["paper"], "title": SKIN["ink"], "frame": SKIN["card"], "panel": SKIN["card"],
+        "panel_text": SKIN["ink"], "text": SKIN["ink"], "muted": SKIN["ink_soft"],
+        "label": SKIN["ink_soft"], "footer": SKIN["ink_soft"], "log_title": SKIN["accent"],
+        **{hue: SKIN[hue] for hue in ("green", "red", "orange", "yellow", "blue")},
+    })
+
+
 # -- App window ---------------------------------------------------------------
 root = TkinterDnD.Tk()
-root.title("Intake Scanner 7.0")
-root.configure(bg="#1e1e1e")
+root.title(f"Intake Scanner {REPORT_VERSION}")
+root.configure(bg=LOOK["window"])
 root.geometry("1200x900")
 root.minsize(1000, 700)
 
@@ -108,18 +239,14 @@ _custom_config_path: Path | None = None
 
 
 def _build_profile_map() -> dict[str, Path | None]:
-    """Build mapping of display names to config file paths."""
-    profiles = {"Default": None}  # None = fallback to DEFAULT_CONFIG if YAML missing
+    """Build mapping of display names to config file paths.
+    v8: each profile is listed under its own profile_name, so configs/default.yaml
+    reads "v7"; v7 forced that entry's name to "Default"."""
+    profiles = {}
     for p in list_builtin_profiles():
         try:
             cfg = load_config(p)
-            name = cfg.get("profile_name", p.stem)
-            if "default" in p.stem.lower():
-                profiles["Default"] = p
-            elif "strict" in p.stem.lower():
-                profiles[name] = p
-            else:
-                profiles[name] = p
+            profiles[cfg.get("profile_name", p.stem)] = p
         except Exception:
             profiles[p.stem] = p
     profiles["Custom YAML..."] = "custom"
@@ -127,29 +254,68 @@ def _build_profile_map() -> dict[str, Path | None]:
 
 
 _profile_map = _build_profile_map()
-profile_var = tk.StringVar(value="Default")
 
 
-def _get_active_config() -> dict:
-    """Load the currently selected profile config."""
+def _startup_profile_name() -> str:
+    """The dropdown entry the app opens on: Platform Band, under whatever name it
+    is listed. If its policy fails to load it is listed by file name and still
+    selected, so the scan stops with the error rather than the app opening
+    on another profile. Only if the pointer file itself is absent does it fall
+    back to the first profile listed."""
+    for name, path in _profile_map.items():
+        if path not in (None, "custom") and Path(path).stem == _STARTUP_PROFILE_STEM:
+            return name
+    return next(iter(_profile_map))
+
+
+profile_var = tk.StringVar(value=_startup_profile_name())
+
+
+def _is_platform_profile(path) -> bool:
+    """True when a profile file is a pointer profile (readout: platform)."""
+    try:
+        import yaml
+        with open(path, "r") as f:
+            return (yaml.safe_load(f) or {}).get("readout") == "platform"
+    except Exception:
+        return False
+
+
+def _get_active_config() -> dict | None:
+    """Load the currently selected profile config.
+    v8: a Platform Band profile that fails to load returns None and the scan
+    stops; it never falls back to another policy. The editing profiles
+    keep v7's fallback to the built-in strict thresholds."""
     selected = profile_var.get()
 
     if selected == "Custom YAML...":
-        if _custom_config_path and _custom_config_path.exists():
-            return load_config(_custom_config_path)
-        log("Default profile not found — using built-in strict thresholds\n", "yellow")
-        return DEFAULT_CONFIG
-
-    config_path = _profile_map.get(selected)
-    if config_path is None or config_path == "custom":
-        log("Default profile not found — using built-in strict thresholds\n", "yellow")
+        config_path = _custom_config_path if _custom_config_path and _custom_config_path.exists() else None
+    else:
+        config_path = _profile_map.get(selected)
+        if config_path == "custom":
+            config_path = None
+    if config_path is None:
+        log("Profile not found — using built-in strict thresholds\n", "yellow")
         return DEFAULT_CONFIG
 
     try:
         return load_config(config_path)
     except Exception as e:
+        if _is_platform_profile(config_path):
+            log(f"Failed to load profile '{selected}': {e}\nThe scan did not run.\n", "red")
+            return None
         log(f"Failed to load profile '{selected}': {e} — using built-in strict thresholds\n", "yellow")
         return DEFAULT_CONFIG
+
+
+def _sync_bias_toggle():
+    """The bias toggle does not apply under Platform Band: the platform has no bias."""
+    selected = profile_var.get()
+    path = _custom_config_path if selected == "Custom YAML..." else _profile_map.get(selected)
+    platform = path not in (None, "custom") and _is_platform_profile(path)
+    bias_check.config(state=tk.DISABLED if platform else tk.NORMAL,
+                      text="Bias compensation  (not used by Platform Band)" if platform
+                      else "Bias compensation  (-0.10 dB)")
 
 
 def _on_profile_change(*args):
@@ -168,10 +334,11 @@ def _on_profile_change(*args):
                 log(f"Loaded custom config: {cfg.get('profile_name', _custom_config_path.name)}\n", "green")
             except Exception as e:
                 log(f"Failed to load config: {e}\n", "red")
-                profile_var.set("Default")
+                profile_var.set(_startup_profile_name())
         else:
-            # User cancelled — revert to default
-            profile_var.set("Default")
+            # User cancelled — revert to the profile the app opens on
+            profile_var.set(_startup_profile_name())
+    _sync_bias_toggle()
 
 
 profile_var.trace_add("write", _on_profile_change)
@@ -181,9 +348,28 @@ profile_var.trace_add("write", _on_profile_change)
 _active_config: dict = DEFAULT_CONFIG  # set at scan start for color decisions
 
 def _warn_color() -> str:
-    """Return the color tag for [WARN] flags — red for strict, orange for default."""
+    """Return the color tag for [WARN] flags — red for strict, orange for default.
+    v8: orange under Platform Band too, matching its WARN label, and for v7
+    (configs/default.yaml's profile, renamed from Default)."""
+    if _active_config.get("readout") == "platform":
+        return "orange"
     name = _active_config.get("profile_name", "").lower()
-    return "orange" if "default" in name else "red"
+    return "orange" if ("default" in name or name == "v7") else "red"
+
+
+def _platform_color(line_upper: str) -> str:
+    """v8, Platform Band: the colour of the worse readout on a Platform: or >>> line."""
+    if "NOISE TAKE" in line_upper:
+        return "blue"
+    if "REJECT" in line_upper or "LEVEL FAIL" in line_upper or "ERROR" in line_upper:
+        return "red"
+    if "WARN" in line_upper:
+        return "orange"
+    if "CAUTION" in line_upper or "HOT" in line_upper or "QUIET" in line_upper:
+        return "yellow"
+    if "NO BAND" in line_upper:
+        return "white"
+    return "green"
 
 def get_tag_for_line(line: str) -> str:
     """Pick a color tag for a report line.
@@ -193,6 +379,13 @@ def get_tag_for_line(line: str) -> str:
     """
     line_upper = line.upper()
     stripped = line.strip()
+
+    # v8 Platform Band: the per-file readout line and its footer
+    if stripped.startswith("Platform:") or stripped.startswith(">>> noise") \
+            or stripped.startswith(">>> NOISE TAKE"):
+        return _platform_color(line_upper)
+    if line.startswith("Format issues (informational"):
+        return "yellow"
 
     # Per-file body — these lines carry flag markers and need severity colors
     if stripped.startswith("Format:"):
@@ -210,10 +403,12 @@ def get_tag_for_line(line: str) -> str:
             return "blue"
         return _warn_color() if "[WARN]" in line else ("yellow" if "[CAUTION]" in line else "white")
     if stripped.startswith("LUFS:"):
-        if "[REJECT]" in line:
+        if "[REJECT]" in line or "[TOO_QUIET]" in line:
             return "red"
         if "[NOISE PROFILE]" in line:
             return "blue"
+        if "[QUIET]" in line:
+            return "yellow"
         return _warn_color() if "[WARN]" in line else ("yellow" if "[CAUTION]" in line else "white")
     if stripped.startswith("PEAK:"):
         return "blue"
@@ -245,12 +440,17 @@ def get_tag_for_line(line: str) -> str:
         wc = _warn_color()
         return wc if "WARN" in line or "REJECT" in line else "yellow"
 
+    # v8: a noise take of digital silence that is not used — a warning, not a baseline
+    if line.startswith("Noise take not used"):
+        return "yellow"
+
     # Noise profile baseline line — keep blue as its established convention
     if line.startswith("Noise profile:"):
         return "blue"
 
     # Missing noise profile warnings stay yellow (cautionary, not error)
-    if line.startswith("WARNING:") or "without folder noise profile" in line:
+    if line.startswith("WARNING:") or "without folder noise profile" in line \
+            or "without a folder noise take" in line:
         return "yellow"
 
     # Peak outlier callouts — blue per existing convention
@@ -392,43 +592,10 @@ def _set_finder_label(file_path: Path, label_index: int):
 
 def _finder_label_for_result(r: dict, config: dict) -> int:
     """Determine Finder label index from scan result and config.
-    Reject (including TP clips) -> Red (2)
-    Salvageable with snr_warn or cf_warn -> Orange (1)
-    Salvageable with only snr_caution -> Yellow (3)
-    Peak outlier (pass but quiet) -> Blue (4)
-    Pass -> Green (6)"""
-    import numpy as np
-
-    disp = r.get("disposition", "pass")
-    if disp == "reject":
-        return 2  # Red
-    if disp == "reference":
-        return 7  # Gray — noise profile reference file
-    if disp == "pass":
-        if r.get("peak_outlier"):
-            return 4  # Blue
-        return 6  # Green
-
-    # Salvageable — check which flags are present to pick orange vs yellow
-    snr_db = r.get("snr_db", float('nan'))
-    cf_db = r.get("crest_factor_db", float('nan'))
-    lufs = r.get("lufs", float('nan'))
-    snr_cfg = config["snr"]
-    cf_cfg = config["crest_factor"]
-    loud_cfg = config.get("loudness", DEFAULT_CONFIG["loudness"])
-
-    has_critical = False
-    nf_source = r.get("noise_floor_source", "unavailable")
-    if not np.isnan(snr_db) and nf_source == "reference" and snr_db < snr_cfg["warn_below"]:
-        has_critical = True  # snr_warn level (reference-based only)
-    if not np.isnan(cf_db):
-        if cf_db <= cf_cfg["warn_low"] or cf_db >= cf_cfg["warn_high"]:
-            has_critical = True  # cf_warn level
-    if not np.isnan(lufs) and lufs != float('-inf'):
-        if lufs < loud_cfg.get("caution_below", loud_cfg.get("warn_below", -36.0)):
-            has_critical = True  # lufs_caution level
-
-    return 1 if has_critical else 3  # Orange if critical, Yellow if minor
+    v8: the mapping lives in the core (finder_label_index) so it can be checked
+    without a window. v7 and Strict keep v7's colours; under Platform Band
+    a file with no answer gets no label."""
+    return finder_label_index(r, config)
 
 def _apply_finder_labels(results: list[dict], config: dict) -> int:
     """Apply Finder color labels based on disposition. Returns count of labeled files."""
@@ -444,94 +611,32 @@ def _apply_finder_labels(results: list[dict], config: dict) -> int:
 
 
 # -- Scan logic ----------------------------------------------------------------
-def run_scan(folder_path: Path, bias_db: float = -0.10, config: dict = None):
+def run_scan(folder_path: Path, bias_db: float = 0.0, config: dict = None):
     global _active_config
     if config is None:
         config = DEFAULT_CONFIG
     _active_config = config
+    platform = config.get("readout") == "platform"
 
     try:
         log_clear()
         profile = config.get("profile_name", "Custom")
-        log(f"Intake Scanner v7.0 — {profile}\n", "title")
+        log(f"Intake Scanner v{REPORT_VERSION} — {profile}\n", "title")
         log("=" * 70 + "\n", "title")
         log(f"Scanning folder:\n{folder_path}\n")
-        if bias_db != 0.0:
+        if platform:
+            log("Platform Band: the bias toggle does not apply (the platform has no bias)\n", "gray")
+        elif bias_db != 0.0:
             log(f"Bias compensation: {bias_db:+.2f} dB (effective TP CLIP threshold: {bias_db:+.2f} dBTP)\n", "yellow")
 
-        exts = {".wav", ".m4a", ".mp3", ".aiff", ".flac", ".aac"}
-        files = sorted(
-            f for f in folder_path.rglob("*")
-            if f.suffix.lower() in exts and f.is_file()
-        )
-
-        if not files:
-            log("No supported audio files found.\n", "yellow")
+        # v8: the scan steps (noise takes, per-file scans, peak outliers) live in
+        # the core's scan_folder(). Its progress lines are v7's live log lines.
+        results = scan_folder(folder_path, config=config, bias_db=bias_db, progress=log)
+        if not results:
             return
 
-        log(f"Found {len(files)} audio files — analyzing...\n")
-
-        # Pre-pass: find and measure noise profile files per folder.
-        # find_noise_profiles() runs naming convention first, then content
-        # fallback (lowest-CF WAV at or below 14.65 dB) for folders with no
-        # named profile. Method is logged so the operator can verify.
-        folder_noise_floors = {}  # parent_folder -> noise_floor_db
-        detected_profiles = find_noise_profiles(folder_path)
-        for parent, (profile_path, method) in detected_profiles.items():
-            try:
-                nf_db = measure_reference_noise_floor(profile_path)
-                folder_noise_floors[parent] = nf_db
-                rel = profile_path.relative_to(folder_path)
-                method_label = "name match" if method == "name" else "content scan"
-                log(f"Noise profile ({method_label}): {rel} — baseline {nf_db:+.1f} dBA\n", "blue")
-            except Exception as e:
-                log(f"Failed to measure noise profile {profile_path.name}: {e}\n", "yellow")
-        if not folder_noise_floors:
-            log("No noise profile files found — using per-file noise estimation\n", "yellow")
-
-        results = []
-        for i, file_path in enumerate(files, 1):
-            log(f"[{i:3}/{len(files)}] {file_path.relative_to(folder_path)}\n")
-            try:
-                # Pass folder's reference noise floor if available (not for the profile file itself)
-                ref_nf = None
-                if not is_noise_profile(file_path):
-                    ref_nf = folder_noise_floors.get(file_path.parent)
-                result = scan_file(file_path, root_dir=folder_path,
-                                   bias_db=bias_db, config=config,
-                                   reference_noise_floor_db=ref_nf)
-                results.append(result)
-            except Exception as e:
-                log(f"   ERROR → {e}\n", "red")
-                results.append({
-                    "path": file_path,
-                    "rel_path": file_path.relative_to(folder_path),
-                    "duration": 0.0,
-                    "sample_rate": "?",
-                    "global_dbtp": float('-inf'),
-                    "events": [f"ERROR → {e}"],
-                    "has_clip": False,
-                    "worst_dbtp": -99.0,
-                    "channels": "?",
-                    "bit_depth": "?",
-                    "noise_floor_db": float('nan'),
-                    "noise_floor_source": "unavailable",
-                    "crest_factor_db": float('nan'),
-                    "rms_db": float('nan'),
-                    "snr_db": float('nan'),
-                    "lufs": float('nan'),
-                    "is_noise_profile": False,
-                    "format_issues": [],
-                    "error": True,
-                    "disposition": "reject",
-                })
-
-        # Flag peak outliers before report generation
-        flag_peak_outliers(results)
-
-        report_path = folder_path / "INTAKE_REPORT.txt"
         try:
-            write_text_report(results, report_path, bias_db=bias_db, config=config)
+            report_path, rows_path = write_reports(results, folder_path, bias_db=bias_db, config=config)
         except Exception as e:
             log(f"\nFAILED to save report: {e}\n", "red")
             return
@@ -540,6 +645,7 @@ def run_scan(folder_path: Path, bias_db: float = -0.10, config: dict = None):
         # Route special lines through their own colorizers; everything else
         # falls through to get_tag_for_line.
         in_skipped_block = False
+        block_color = "red"
         for line in build_report_lines(results, bias_db=bias_db, config=config):
             if line.startswith("Disposition:"):
                 _log_disposition_line(line)
@@ -549,28 +655,44 @@ def run_scan(folder_path: Path, bias_db: float = -0.10, config: dict = None):
                 _log_tpclips_line(line)
                 in_skipped_block = False
                 continue
-            if line.startswith("Skipped (format mismatch)"):
-                log(line + "\n", "red")
+            if line.startswith("Skipped (format mismatch)") or line.startswith("Format issues (informational"):
+                # v8: under Platform Band a format issue is informational (yellow).
+                block_color = "red" if line.startswith("Skipped") else "yellow"
+                log(line + "\n", block_color)
                 in_skipped_block = True
                 continue
             # Detail lines of the skipped block are 2-space-indented right
             # after the header; end the block on the first non-indented line.
             if in_skipped_block and line.startswith("  "):
-                log(line + "\n", "red")
+                log(line + "\n", block_color)
                 continue
             in_skipped_block = False
             log(line + "\n")
 
-        # Summary with disposition counts
-        content = [r for r in results if not r.get("is_noise_profile")]
-        n_pass = sum(1 for r in content if r.get("disposition") == "pass")
-        n_salv = sum(1 for r in content if r.get("disposition") == "salvageable")
-        n_rej  = sum(1 for r in content if r.get("disposition") == "reject")
-        clips  = sum(1 for r in results if r.get("has_clip", False))
+        if platform:
+            # v8: Platform Band reads as two counts, noise band and level verdict.
+            read_out = [r for r in results if (r.get("platform") or {}).get("level")]
+            bands = {}
+            for r in read_out:
+                noise = r["platform"]["noise"]
+                key = noise["disposition"] if noise else "no band"
+                bands[key] = bands.get(key, 0) + 1
+            n_fail = sum(1 for r in read_out if r["platform"]["level"]["verdict"] == "FAIL")
+            log(f"\nSCAN COMPLETE — noise band {bands.get('PASS', 0)} PASS / "
+                f"{bands.get('CAUTION', 0)} CAUTION / {bands.get('WARN', 0)} WARN / "
+                f"{bands.get('REJECT', 0)} REJECT / {bands.get('no band', 0)} no band"
+                f" — level {len(read_out) - n_fail} PASS / {n_fail} FAIL\n", "title")
+        else:
+            # Summary with disposition counts
+            content = [r for r in results if not r.get("is_noise_profile")]
+            n_pass = sum(1 for r in content if r.get("disposition") == "pass")
+            n_salv = sum(1 for r in content if r.get("disposition") == "salvageable")
+            n_rej  = sum(1 for r in content if r.get("disposition") == "reject")
+            clips  = sum(1 for r in results if r.get("has_clip", False))
 
-        log(f"\nSCAN COMPLETE — {n_pass} pass / {n_salv} salvageable / {n_rej} reject\n", "title")
-        if clips:
-            log(f"{clips} file(s) with true-peak clipping\n", "red")
+            log(f"\nSCAN COMPLETE — {n_pass} pass / {n_salv} salvageable / {n_rej} reject\n", "title")
+            if clips:
+                log(f"{clips} file(s) with true-peak clipping\n", "red")
 
         # Apply Finder color labels
         labeled = _apply_finder_labels(results, config)
@@ -578,6 +700,7 @@ def run_scan(folder_path: Path, bias_db: float = -0.10, config: dict = None):
             log(f"Finder labels applied: {labeled} files\n", "green")
 
         log(f"Report saved: {report_path}\n", "title")
+        log(f"Rows saved:   {rows_path}\n", "title")
         log_scroll_top()
 
     except Exception as e:
@@ -593,11 +716,13 @@ def _start_scan(folder_path: Path, bias_db: float = None, config: dict = None):
     global _scan_in_progress
     if _scan_in_progress:
         return
-    _scan_in_progress = True
     if bias_db is None:
         bias_db = -0.10 if bias_var.get() else 0.0
     if config is None:
         config = _get_active_config()
+        if config is None:          # v8: a Platform Band profile that failed to load
+            return
+    _scan_in_progress = True
     scan_button.config(state=tk.DISABLED, text="Scanning...")
     threading.Thread(target=run_scan, args=(folder_path, bias_db, config), daemon=False).start()
 
@@ -626,76 +751,171 @@ root.dnd_bind('<<Drop>>', on_drop)
 
 
 # -- UI layout -----------------------------------------------------------------
-tk.Label(root, text="Intake Scanner", font=("Helvetica", 36, "bold"),
-         fg="#00ffaa", bg="#1e1e1e", pady=50).pack()
+import tkinter.font as tkfont
 
-frame = tk.Frame(root, bg="#0a0a0a", bd=3, relief="sunken")
+
+def _sys_font(size: int, weight: str = "normal"):
+    """The macOS system font at a size (the skin's labels and controls use it)."""
+    return (tkfont.nametofont("TkDefaultFont").actual("family"), size, weight)
+
+
+class AccentButton(tk.Canvas):
+    """The scan button under the skin, drawn by hand on --accent-fill with a white
+    label. config(state=..., text=...) works as on a tk.Button, so the scan
+    code calls it the same way. Disabled: --line fill, --ink-soft label. No hover
+    colour, because dark --accent under white measures 3.59:1 and fails."""
+
+    def __init__(self, parent, text, command, font, width, height=72, radius=14):
+        super().__init__(parent, width=width, height=height, bg=SKIN["paper"],
+                         highlightthickness=0, bd=0)
+        self._text, self._command, self._font = text, command, font
+        self._state = tk.NORMAL
+        self._radius = radius if _ROUNDED_BUTTON else 0
+        self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w, h, r = int(self["width"]) - 1, int(self["height"]) - 1, self._radius
+        enabled = self._state != tk.DISABLED
+        fill = SKIN["accent_fill"] if enabled else SKIN["line"]
+        if r:
+            # A smoothed polygon with doubled corner points draws a rounded rectangle.
+            points = [r, 0, r, 0, w - r, 0, w - r, 0, w, 0, w, r, w, r, w, h - r, w, h - r,
+                      w, h, w - r, h, w - r, h, r, h, r, h, 0, h, 0, h - r, 0, h - r,
+                      0, r, 0, r, 0, 0]
+            self.create_polygon(points, smooth=True, fill=fill, outline=fill)
+        else:
+            self.create_rectangle(0, 0, w, h, fill=fill, outline=fill)
+        self.create_text(w // 2, h // 2, text=self._text, font=self._font,
+                         fill="#ffffff" if enabled else SKIN["ink_soft"])
+        self.configure(cursor="hand2" if enabled else "arrow")
+
+    def _click(self, _event):
+        if self._state != tk.DISABLED:
+            self._command()
+
+    def config(self, cnf=None, **kw):
+        """Take a tk.Button's state= and text=; pass anything else to the canvas."""
+        redraw = "state" in kw or "text" in kw
+        self._state = kw.pop("state", self._state)
+        self._text = kw.pop("text", self._text)
+        if cnf or kw:
+            super().configure(cnf, **kw)
+        if redraw:
+            self._draw()
+
+    configure = config
+
+
+title_label = tk.Label(root, text="Intake Scanner",
+                       font=("Georgia", 36) if SKIN else ("Helvetica", 36, "bold"),
+                       fg=LOOK["title"], bg=LOOK["window"], pady=50)
+title_label.pack()
+
+if SKIN:
+    # The report panel: a --card ground with a --line edge.
+    frame = tk.Frame(root, bg=LOOK["frame"], bd=0, highlightthickness=1,
+                     highlightbackground=SKIN["line"], highlightcolor=SKIN["line"])
+else:
+    frame = tk.Frame(root, bg=LOOK["frame"], bd=3, relief="sunken")
 frame.pack(padx=40, pady=(0, 40), fill="both", expand=True)
 
 output = scrolledtext.ScrolledText(
-    frame, font=("Menlo", 13), bg="#0d0d0d", fg="#d4d4d4",
-    insertbackground="#d4d4d4", state=tk.DISABLED, relief="flat", wrap="word"
+    frame, font=("Menlo", 13), bg=LOOK["panel"], fg=LOOK["panel_text"],
+    insertbackground=LOOK["panel_text"], state=tk.DISABLED, relief="flat", wrap="word",
+    **({"highlightthickness": 0} if SKIN else {})
 )
-output.tag_config("green",  foreground="#00ff88")
-output.tag_config("red",    foreground="#ff6666")
-output.tag_config("orange", foreground="#ff9933")
-output.tag_config("yellow", foreground="#ffdd44")
-output.tag_config("blue",   foreground="#66aaff")
-output.tag_config("gray",   foreground="#888888")
-output.tag_config("white",  foreground="#ffffff")
-output.tag_config("title",  foreground="#00ffaa", font=("Helvetica", 16, "bold"))
+for _hue in ("green", "red", "orange", "yellow", "blue"):
+    output.tag_config(_hue, foreground=LOOK[_hue])
+output.tag_config("gray",   foreground=LOOK["muted"])
+output.tag_config("white",  foreground=LOOK["text"])
+# Under the skin the report stays a monospace log, its title lines included.
+output.tag_config("title",  foreground=LOOK["log_title"],
+                  font=("Menlo", 13, "bold") if SKIN else ("Helvetica", 16, "bold"))
 # Default (no-error) lines now render pure white per v6.1 spec
-output.tag_config("mono",   font=("Menlo", 12), foreground="#ffffff")
+output.tag_config("mono",   font=("Menlo", 12), foreground=LOOK["text"])
 output.pack(fill="both", expand=True, padx=18, pady=18)
 
 # -- Controls row ---------------------------------------------------------------
-controls_frame = tk.Frame(root, bg="#1e1e1e")
+controls_frame = tk.Frame(root, bg=LOOK["window"])
 controls_frame.pack(pady=(0, 5))
 
+_label_font = _sys_font(13) if SKIN else ("Helvetica", 12)
+
 # Profile selector
-tk.Label(controls_frame, text="Profile:", font=("Helvetica", 12),
-         fg="#aaaaaa", bg="#1e1e1e").pack(side="left", padx=(0, 8))
+tk.Label(controls_frame, text="Profile:", font=_label_font,
+         fg=LOOK["label"], bg=LOOK["window"]).pack(side="left", padx=(0, 8))
 
 profile_menu = tk.OptionMenu(controls_frame, profile_var, *_profile_map.keys())
-profile_menu.config(
-    font=("Helvetica", 12), bg="#2a2a2a", fg="#ffffff",
-    activebackground="#3a3a3a", activeforeground="#ffffff",
-    highlightthickness=0, relief="flat", cursor="hand2",
-    width=28,
-)
-profile_menu["menu"].config(
-    font=("Helvetica", 12), bg="#2a2a2a", fg="#ffffff",
-    activebackground="#00ccff", activeforeground="black",
-)
+if SKIN:
+    # The dropdown stays native; only its surround takes the window ground.
+    profile_menu.config(width=28, cursor="hand2", highlightthickness=0, bg=LOOK["window"])
+else:
+    profile_menu.config(
+        font=("Helvetica", 12), bg="#2a2a2a", fg="#ffffff",
+        activebackground="#3a3a3a", activeforeground="#ffffff",
+        highlightthickness=0, relief="flat", cursor="hand2",
+        width=28,
+    )
+    profile_menu["menu"].config(
+        font=("Helvetica", 12), bg="#2a2a2a", fg="#ffffff",
+        activebackground="#00ccff", activeforeground="black",
+    )
 profile_menu.pack(side="left", padx=(0, 20))
 
 # Bias checkbox
-bias_check = tk.Checkbutton(
-    controls_frame, text="Bias compensation  (-0.10 dB)",
-    variable=bias_var, font=("Helvetica", 12),
-    fg="#aaaaaa", bg="#1e1e1e", activebackground="#1e1e1e",
-    activeforeground="#ffffff", selectcolor="#1e1e1e",
-    cursor="hand2"
-)
+if SKIN:
+    # The checkbox stays native; its label takes the ink on the window ground.
+    bias_check = tk.Checkbutton(
+        controls_frame, text="Bias compensation  (-0.10 dB)",
+        variable=bias_var, font=_label_font,
+        fg=SKIN["ink"], bg=LOOK["window"], activebackground=LOOK["window"],
+        highlightthickness=0, cursor="hand2"
+    )
+else:
+    bias_check = tk.Checkbutton(
+        controls_frame, text="Bias compensation  (-0.10 dB)",
+        variable=bias_var, font=("Helvetica", 12),
+        fg="#aaaaaa", bg="#1e1e1e", activebackground="#1e1e1e",
+        activeforeground="#ffffff", selectcolor="#1e1e1e",
+        cursor="hand2"
+    )
 bias_check.pack(side="left")
+_sync_bias_toggle()
 
-scan_button = tk.Button(
-    root, text="Select Folder → Scan",
-    command=select_folder, font=("Helvetica", 19, "bold"),
-    bg="#00ccff", fg="black", activebackground="#00eeff",
-    pady=28, relief="flat", cursor="hand2"
-)
+if SKIN:
+    _button_font = _sys_font(19, "bold")
+    scan_button = AccentButton(
+        root, text="Select Folder → Scan", command=select_folder, font=_button_font,
+        width=tkfont.Font(font=_button_font).measure("Select Folder → Scan") + 120,
+    )
+else:
+    scan_button = tk.Button(
+        root, text="Select Folder → Scan",
+        command=select_folder, font=("Helvetica", 19, "bold"),
+        bg="#00ccff", fg="black", activebackground="#00eeff",
+        pady=28, relief="flat", cursor="hand2"
+    )
 scan_button.pack(pady=35)
 
-tk.Label(root, text="MAD Audio Tools • v7.0 • May 2026", font=("Helvetica", 10),
-         fg="#666666", bg="#1e1e1e").pack(side="bottom", pady=20)
+tk.Label(root, text=f"MAD Audio Tools • v{REPORT_VERSION} • October 2026",
+         font=_sys_font(11) if SKIN else ("Helvetica", 10),
+         fg=LOOK["footer"], bg=LOOK["window"]).pack(side="bottom", pady=20)
+
+if SKIN_PROBLEM:
+    log(f"Skin not applied: {SKIN_PROBLEM}. The window keeps a plain dark look.\n", "yellow")
 
 
 # -- Start queue processor & run -----------------------------------------------
 root.after(50, _process_log_queue)
 
 # Auto-start scan if launched with --headless
-_headless_args = _parse_headless_args()
+try:
+    _headless_args = _parse_headless_args()
+except Exception as _headless_error:     # v8: say why in the window, not a silent crash
+    _headless_args = None
+    log(f"Headless scan not started: {_headless_error}\n", "red")
 if _headless_args:
     _hl_folder, _hl_bias, _hl_config = _headless_args
     root.after(100, lambda: _start_scan(_hl_folder, bias_db=_hl_bias, config=_hl_config))
